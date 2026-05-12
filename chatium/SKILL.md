@@ -1,6 +1,6 @@
 ---
 name: chatium
-description: Work safely in Chatium projects that are already synchronized by the Chatium VS Code extension. Use when Codex edits local files under VS Code globalStorage/chatium.chatium-sync account folders, needs to pull external Chatium changes before editing, create a local git baseline, and publish local file changes back to Chatium through existing entity APIs. Do not use outside a folder already synced by the VS Code extension.
+description: Work safely in Chatium projects that are already synchronized by the Chatium VS Code extension. Use when Codex reads, searches, plans, or edits local files under VS Code globalStorage/chatium.chatium-sync account folders, must pull external Chatium changes before inspecting project source, create a local git baseline, and publish local file changes back to Chatium through existing entity APIs. Do not use outside a folder already synced by the VS Code extension.
 ---
 
 # Chatium
@@ -21,12 +21,14 @@ Always run:
 
 1. `doctor` when you need to inspect whether the folder is a valid Chatium sync root.
 2. `init` once per synced account folder to store the user-provided token in `<syncRoot>/.chatium/codex-auth.json`.
-3. `begin` before planning work in a Chatium-synced project. This pulls the latest server code and creates the planning baseline.
+3. `begin` before reading, searching, opening, or planning from project source files in a Chatium-synced project. This pulls the latest server code and creates the planning baseline.
 4. Run `begin` again immediately before editing files for the user. This refreshes to the latest server code and creates the implementation baseline.
 5. Make the requested local code changes.
 6. `finish` after local changes are complete.
 
 Do not run `begin`, `pull`, or `finish` if `init` has not stored auth yet.
+
+After this skill triggers, treat source inspection as planning. Do not run `rg`, `sed`, `cat`, `ls`, open component files, inspect tests, or otherwise read project source before `begin` succeeds. The only allowed pre-`begin` actions are reading this skill, running `doctor`, and running `init` when auth is missing.
 
 If `begin` reports a Chatium sync conflict, stop before planning or editing and ask the user how to resolve it.
 
