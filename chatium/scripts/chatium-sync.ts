@@ -87,6 +87,17 @@ type RemoteTreeResponse = {
   socketBaseUrl?: string
 }
 
+type MonacoDocsResponse = {
+  deps?: Record<string, MonacoDocsRecord>
+  tsconfigJsonContent?: string
+  packageJsonContent?: string
+}
+
+type MonacoDocsRecord = {
+  content?: string
+  isFile?: boolean
+}
+
 type Change =
   | { status: 'A' | 'M' | 'D'; path: string }
   | { status: 'R'; oldPath: string; path: string }
@@ -117,6 +128,8 @@ async function main() {
       return init(args)
     case 'pull':
       return pullCommand(args)
+    case 'typings':
+      return typingsCommand(args)
     case 'begin':
       return begin(args)
     case 'finish':
@@ -154,6 +167,7 @@ function printHelp() {
   npx -y tsx chatium/scripts/chatium-sync.ts doctor [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts init [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts pull [--cwd DIR]
+  npx -y tsx chatium/scripts/chatium-sync.ts typings [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts begin [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts finish [--cwd DIR]
 
@@ -222,6 +236,14 @@ async function pullCommand(args: CliArgs) {
   console.log(`Pulled ${Object.keys(tree.items ?? {}).length} tracked Chatium item(s).`)
 }
 
+async function typingsCommand(args: CliArgs) {
+  const env = preflight(args)
+  const auth = readAuth(env)
+  ensureGitExcludeIfRepo(env.syncRoot)
+  const written = await refreshGeneratedTypings(env, auth)
+  console.log(`Refreshed generated typings (${written} file(s)).`)
+}
+
 async function begin(args: CliArgs) {
   const env = preflight(args)
   const auth = readAuth(env)
@@ -229,6 +251,8 @@ async function begin(args: CliArgs) {
 
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
+  const written = await refreshGeneratedTypings(env, auth)
+  console.log(`Refreshed generated typings (${written} file(s)).`)
   const baselineCommit = createAndStoreBaseline(env)
   console.log(`Baseline commit: ${baselineCommit}`)
 }
@@ -511,6 +535,70 @@ async function fetchRemoteTree(env: Env, auth: AuthFile, tree: TreeFile) {
 
 function mapRemoteItems(items: Entity[]): Record<string, Entity> {
   return Object.fromEntries(items.filter(item => !isSystemPath(item.path)).map(item => [item.path, item]))
+}
+
+async function refreshGeneratedTypings(env: Env, auth: AuthFile): Promise<number> {
+  const tree = readTree(env)
+  const response = await requestJson<MonacoDocsResponse>(
+    env,
+    auth,
+    '/s/entity/monaco-get-all-builtin-content',
+    { method: 'GET' },
+    tree,
+  )
+  const deps = response.body.deps
+  if (!deps || typeof deps !== 'object') {
+    throw new Error('Chatium Monaco docs response has no deps')
+  }
+
+  const nodeModulesRoot = path.join(env.syncRoot, 'node_modules')
+  const writes: Array<{ content: string; filePath: string }> = []
+  for (const [key, record] of Object.entries(deps)) {
+    if (!record || typeof record !== 'object') {
+      throw new Error(`Invalid Monaco docs record: ${key}`)
+    }
+    if (typeof record.content !== 'string') {
+      throw new Error(`Monaco docs record has no content: ${key}`)
+    }
+
+    const filePath = resolveGeneratedTypingPath(nodeModulesRoot, key, Boolean(record.isFile))
+    writes.push({ content: record.content, filePath })
+  }
+
+  rmSync(nodeModulesRoot, { force: true, recursive: true })
+
+  for (const { content, filePath } of writes) {
+    mkdirSync(path.dirname(filePath), { recursive: true })
+    writeFileSync(filePath, content, 'utf8')
+  }
+
+  if (typeof response.body.tsconfigJsonContent === 'string') {
+    writeFileSync(path.join(env.syncRoot, 'tsconfig.json'), response.body.tsconfigJsonContent, 'utf8')
+  }
+  if (typeof response.body.packageJsonContent === 'string') {
+    writeFileSync(path.join(env.syncRoot, 'package.json'), response.body.packageJsonContent, 'utf8')
+  }
+
+  return writes.length
+}
+
+function resolveGeneratedTypingPath(nodeModulesRoot: string, key: string, isFile: boolean): string {
+  const normalizedKey = normalizePath(key)
+  if (!normalizedKey || normalizedKey.startsWith('/') || path.isAbsolute(key) || /^[a-zA-Z]:\//.test(normalizedKey)) {
+    throw new Error(`Unsafe Monaco docs path: ${key}`)
+  }
+
+  const relativePath = !normalizedKey.endsWith('.d.ts') && !isFile ? `${normalizedKey}/index.d.ts` : normalizedKey
+  const segments = relativePath.split('/')
+  if (segments.some(segment => segment === '' || segment === '.' || segment === '..' || segment.includes('\0'))) {
+    throw new Error(`Unsafe Monaco docs path: ${key}`)
+  }
+
+  const filePath = path.resolve(nodeModulesRoot, ...segments)
+  if (!isInsideOrSame(filePath, nodeModulesRoot)) {
+    throw new Error(`Unsafe Monaco docs path: ${key}`)
+  }
+  return filePath
 }
 
 async function downloadFile(env: Env, auth: AuthFile, id: string, filePath: string): Promise<Entity | undefined> {
@@ -866,6 +954,11 @@ function createAndStoreBaseline(env: Env): string {
 
 function commitBaseline(env: Env) {
   git(env.syncRoot, ['add', '-A', '--', '.'])
+  git(
+    env.syncRoot,
+    ['reset', '-q', '--', '.chatium', '.vscode', 'node_modules', 'tsconfig.json', 'package.json', '.gitignore', '.DS_Store'],
+    { allowFailure: true },
+  )
   const staged = git(env.syncRoot, ['diff', '--cached', '--quiet'], { allowFailure: true })
   const commitArgs =
     staged.status === 0

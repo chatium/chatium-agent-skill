@@ -51,6 +51,19 @@ Never upload or inspect these as Chatium source files:
 - `package.json`
 - `*.DS_Store`
 
+## Generated Typings
+
+The helper mirrors the VS Code extension `MonacoDocsSyncer` for generated typings:
+
+- `begin` refreshes typings every time after `pull` and before the git baseline.
+- `typings` can be run directly to refresh only generated typings.
+- The helper calls `GET /s/entity/monaco-get-all-builtin-content`.
+- The response `deps` map is written under `<syncRoot>/node_modules`.
+- If a dependency key does not end with `.d.ts` and the record is not marked `isFile`, write it as `<key>/index.d.ts`.
+- If present, `tsconfigJsonContent` and `packageJsonContent` are written to root `tsconfig.json` and `package.json`.
+- Server-provided dependency paths must stay inside `<syncRoot>/node_modules`; reject absolute paths, `..`, empty segments, and drive-root paths.
+- Generated paths remain excluded from git baselines and Chatium uploads.
+
 ## Auth
 
 Existing entity APIs accept the token as a cookie:
@@ -111,6 +124,7 @@ Endpoints:
 
 - `GET /s/entity/get-tree`
 - `GET /s/entity/get-code/:id`
+- `GET /s/entity/monaco-get-all-builtin-content`
 - `POST /s/entity/update-code`
 - `POST /s/entity/delete`
 - `POST /s/entity/rename`
