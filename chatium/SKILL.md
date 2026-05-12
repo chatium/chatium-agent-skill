@@ -21,13 +21,23 @@ Always run:
 
 1. `doctor` when you need to inspect whether the folder is a valid Chatium sync root.
 2. `init` once per synced account folder to store the user-provided token in `<syncRoot>/.chatium/codex-auth.json`.
-3. `begin` before editing files for the user.
-4. Make the requested local code changes.
-5. `finish` after local changes are complete.
+3. `begin` before planning work in a Chatium-synced project. This pulls the latest server code and creates the planning baseline.
+4. Run `begin` again immediately before editing files for the user. This refreshes to the latest server code and creates the implementation baseline.
+5. Make the requested local code changes.
+6. `finish` after local changes are complete.
 
 Do not run `begin`, `pull`, or `finish` if `init` has not stored auth yet.
 
+If `begin` reports a Chatium sync conflict, stop before planning or editing and ask the user how to resolve it.
+
 ## Recovering from finish conflicts
+
+If `finish` fails with `Cannot reapply stashed local changes over latest server version`:
+
+1. Do not upload local changes.
+2. Inspect the conflicted files reported by git.
+3. Ask the user how to resolve the conflict based on the current server version and the intended task change.
+4. After the conflict is resolved, run the smallest relevant validation and then run `finish` again.
 
 If `finish` fails with `cannot reapply local changes over server version`:
 
@@ -49,7 +59,7 @@ If the intended resolution is ambiguous, stop and ask the user how exactly to re
 - `init`: runs the same preflight, prompts the user for a token, saves it locally, and excludes `.chatium/` from git.
 - `pull`: downloads safe remote changes using the existing Chatium API and updates the VS Code extension `tree.json`.
 - `begin`: runs `pull`, initializes git in the sync root if needed, excludes local system paths, and creates a baseline commit.
-- `finish`: uploads changes since the baseline commit and retries one-file conflicts by applying Codex changes over the latest server version.
+- `finish`: stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, and uploads only the diff from that new baseline. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
 
 All commands must fail outside a VS Code extension synced folder with:
 
@@ -63,6 +73,7 @@ Open this project through the Chatium VS Code extension first.
 - Never print the token after `init`.
 - Never read VS Code SecretStorage or `state.vscdb` token blobs.
 - Stop on pre-existing both-changed conflicts before making user-requested edits.
+- If final stash reapply fails, keep the conflicted worktree and the stash, do not upload, and ask the user how to resolve the conflict.
 - If `finish` cannot reapply local changes on top of a newer server file, keep the server file on disk, save conflict artifacts under `.chatium/conflicts/`, and report the path.
 
 ## Reference

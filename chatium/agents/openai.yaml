@@ -1,4 +1,4 @@
 interface:
   display_name: "Chatium"
   short_description: "Work safely in Chatium projects synced by the VS Code extension."
-  default_prompt: "Use the Chatium skill to initialize auth, pull external changes, create a baseline, and publish local changes for this synced project."
+  default_prompt: "Use the Chatium skill to run begin before planning and editing, create fresh baselines, and refresh server code before publishing local changes."

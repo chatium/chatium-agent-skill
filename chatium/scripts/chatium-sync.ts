@@ -22,6 +22,7 @@ const authFileName = 'codex-auth.json'
 const stateFileName = 'codex-state.json'
 const failureOpenInVscode = 'Open this project through the Chatium VS Code extension first.'
 const baselineMessage = 'chatium baseline before codex work'
+const finishStashMessage = 'chatium local changes before finish refresh'
 
 type Entity = {
   id: string
@@ -87,6 +88,11 @@ type Change =
 type CliArgs = {
   command: string
   cwd: string
+}
+
+type FinishStash = {
+  commit: string
+  ref: 'stash@{0}'
 }
 
 main().catch(error => {
@@ -205,31 +211,40 @@ async function begin(args: CliArgs) {
 
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
-  commitBaseline(env)
-
-  const baselineCommit = git(env.syncRoot, ['rev-parse', 'HEAD']).stdout.trim()
-  const state: StateFile = {
-    accountKey: env.accountKey,
-    baselineCommit,
-    createdAt: new Date().toISOString(),
-  }
-  writeJson(env.statePath, state)
-  chmodSync(env.statePath, 0o600)
+  const baselineCommit = createAndStoreBaseline(env)
   console.log(`Baseline commit: ${baselineCommit}`)
 }
 
 async function finish(args: CliArgs) {
   const env = preflight(args)
   const auth = readAuth(env)
-  const state = readState(env)
-  const tree = readTree(env)
-  const changes = getChangesSinceBaseline(env, state.baselineCommit)
+  readState(env)
+  ensureGitRepo(env.syncRoot)
+  ensureGitExcludeIfRepo(env.syncRoot)
+
+  const stash = stashLocalChanges(env)
+  let baselineCommit: string
+
+  try {
+    await pull(env, auth)
+    baselineCommit = createAndStoreBaseline(env)
+
+    if (stash) {
+      applyFinishStash(env, stash)
+      dropFinishStash(env, stash)
+    }
+  } catch (error) {
+    throw withPreservedStashMessage(error, stash)
+  }
+
+  const changes = getChangesSinceBaseline(env, baselineCommit)
 
   if (changes.length === 0) {
     console.log('No local changes since Chatium baseline.')
     return
   }
 
+  const tree = readTree(env)
   const remote = await fetchRemoteTree(env, auth, tree)
   const remoteItems = mapRemoteItems(remote.body.items)
   saveTree(env, tree)
@@ -242,12 +257,12 @@ async function finish(args: CliArgs) {
     if (change.status === 'R') {
       const filePath = path.join(env.syncRoot, change.path)
       if (existsSync(filePath) && sha1File(filePath) !== tree.items?.[change.path]?.syncedChecksum) {
-        await uploadFile(env, auth, tree, remoteItems, change.path, state.baselineCommit)
+        await uploadFile(env, auth, tree, remoteItems, change.path, baselineCommit)
       }
     } else if (change.status === 'D') {
       await uploadDelete(env, auth, tree, remoteItems, change.path)
     } else {
-      await uploadFile(env, auth, tree, remoteItems, change.path, state.baselineCommit)
+      await uploadFile(env, auth, tree, remoteItems, change.path, baselineCommit)
     }
   }
 
@@ -803,6 +818,20 @@ function ensureGitExcludeIfRepo(syncRoot: string) {
   }
 }
 
+function createAndStoreBaseline(env: Env): string {
+  commitBaseline(env)
+
+  const baselineCommit = git(env.syncRoot, ['rev-parse', 'HEAD']).stdout.trim()
+  const state: StateFile = {
+    accountKey: env.accountKey,
+    baselineCommit,
+    createdAt: new Date().toISOString(),
+  }
+  writeJson(env.statePath, state)
+  chmodSync(env.statePath, 0o600)
+  return baselineCommit
+}
+
 function commitBaseline(env: Env) {
   git(env.syncRoot, ['add', '-A', '--', '.'])
   const staged = git(env.syncRoot, ['diff', '--cached', '--quiet'], { allowFailure: true })
@@ -811,6 +840,79 @@ function commitBaseline(env: Env) {
       ? ['commit', '--allow-empty', '-m', baselineMessage]
       : ['commit', '-m', baselineMessage]
   git(env.syncRoot, ['-c', 'user.name=Codex', '-c', 'user.email=codex@local', ...commitArgs])
+}
+
+function stashLocalChanges(env: Env): FinishStash | null {
+  const before = revParseStash(env)
+  const result = git(env.syncRoot, ['stash', 'push', '--include-untracked', '-m', finishStashMessage, '--', '.'], {
+    allowFailure: true,
+  })
+
+  if (result.status !== 0) {
+    throw new Error(`git stash push failed:\n${result.stderr || result.stdout}`)
+  }
+
+  const after = revParseStash(env)
+  if (!after || after === before) {
+    return null
+  }
+
+  return { commit: after, ref: 'stash@{0}' }
+}
+
+function applyFinishStash(env: Env, stash: FinishStash) {
+  const result = git(env.syncRoot, ['stash', 'apply', stash.ref], { allowFailure: true })
+  if (result.status === 0) {
+    return
+  }
+
+  const conflicts = getConflictedPaths(env)
+  const conflictDetails =
+    conflicts.length > 0
+      ? `Conflicted files:\n${conflicts.map(item => `- ${item}`).join('\n')}`
+      : `Git status:\n${getShortGitStatus(env) || '(no conflicted paths reported by git)'}`
+  const gitOutput = (result.stderr || result.stdout).trim()
+  const outputDetails = gitOutput ? `\n\nGit output:\n${gitOutput}` : ''
+
+  throw new Error(
+    `Cannot reapply stashed local changes over latest server version.\n${conflictDetails}\nStash kept as ${stash.ref} (${stash.commit}). Do not upload local changes. Ask the user how to resolve this conflict before editing or retrying finish.${outputDetails}`,
+  )
+}
+
+function dropFinishStash(env: Env, stash: FinishStash) {
+  const top = revParseStash(env)
+  if (!top) {
+    return
+  }
+  if (top !== stash.commit) {
+    throw new Error(`Refusing to drop ${stash.ref}: it no longer points to expected stash commit ${stash.commit}.`)
+  }
+  git(env.syncRoot, ['stash', 'drop', stash.ref])
+}
+
+function withPreservedStashMessage(error: unknown, stash: FinishStash | null): Error {
+  const message = error instanceof Error ? error.message : String(error)
+  if (!stash || message.includes('Stash kept as')) {
+    return error instanceof Error ? error : new Error(message)
+  }
+  return new Error(`${message}\nLocal changes are preserved in ${stash.ref} (${stash.commit}). Fix the problem, then run finish again.`)
+}
+
+function revParseStash(env: Env): string | null {
+  const result = git(env.syncRoot, ['rev-parse', '-q', '--verify', 'refs/stash'], { allowFailure: true })
+  if (result.status !== 0) {
+    return null
+  }
+  return result.stdout.trim() || null
+}
+
+function getConflictedPaths(env: Env): string[] {
+  const result = git(env.syncRoot, ['diff', '--name-only', '--diff-filter=U', '--'], { allowFailure: true })
+  return result.stdout.split(/\r?\n/).map(normalizePath).filter(Boolean)
+}
+
+function getShortGitStatus(env: Env): string {
+  return git(env.syncRoot, ['status', '--short'], { allowFailure: true }).stdout.trim()
 }
 
 function getChangesSinceBaseline(env: Env, baselineCommit: string): Change[] {
