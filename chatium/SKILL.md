@@ -1,6 +1,6 @@
 ---
 name: chatium
-description: Work safely in Chatium projects that are already synchronized by the Chatium VS Code extension. Use when Codex reads, searches, plans, or edits local files under VS Code globalStorage/chatium.chatium-sync account folders, must pull external Chatium changes before inspecting project source, create a local git baseline, and publish local file changes back to Chatium through existing entity APIs. Do not use outside a folder already synced by the VS Code extension.
+description: Work safely in Chatium projects that are already synchronized by the Chatium VS Code extension. Use when the assistant (Codex, Claude Code, or any other agent) reads, searches, plans, or edits local files under VS Code globalStorage/chatium.chatium-sync account folders, must pull external Chatium changes before inspecting project source, create a local git baseline, and publish local file changes back to Chatium through existing entity APIs. Do not use outside a folder already synced by the VS Code extension.
 ---
 
 # Chatium
@@ -8,6 +8,8 @@ description: Work safely in Chatium projects that are already synchronized by th
 ## Overview
 
 Use this skill only inside a project folder that was opened and synchronized by the Chatium VS Code extension. The skill never changes Chatium backend behavior and never tries to read VS Code SecretStorage.
+
+The skill is agent-agnostic. It is shipped for both Codex (via `agents/openai.yaml`) and Claude Code (via the standard `~/.claude/skills/chatium/SKILL.md` skill loader). The exact same helper script and rules apply in both environments.
 
 ## Required Workflow
 
@@ -17,10 +19,12 @@ Run the TypeScript helper with `tsx`:
 npx -y tsx /path/to/chatium/scripts/chatium-sync.ts <command> --cwd "$PWD"
 ```
 
+On Windows PowerShell use `${PWD}` instead of `"$PWD"`.
+
 Always run:
 
 1. `doctor` when you need to inspect whether the folder is a valid Chatium sync root.
-2. `init` once per synced account folder to store the user-provided token in `<syncRoot>/.chatium/codex-auth.json`.
+2. `init` once per synced account folder to store the user-provided token in `<syncRoot>/.chatium/auth.json`.
 3. `begin` before reading, searching, opening, or planning from project source files in a Chatium-synced project. This pulls the latest server code and creates the planning baseline.
 4. Run `begin` again immediately before editing files for the user. This refreshes to the latest server code and creates the implementation baseline.
 5. Make the requested local code changes.
@@ -44,7 +48,7 @@ If `finish` fails with `Cannot reapply stashed local changes over latest server 
 If `finish` fails with `cannot reapply local changes over server version`:
 
 1. Do not retry `finish` immediately.
-2. Inspect the current file on disk and the saved `.chatium/conflicts/.../codex.patch`.
+2. Inspect the current file on disk and the saved `.chatium/conflicts/.../local.patch` (legacy name: `codex.patch`).
 3. Treat the current file on disk as the latest server version.
 4. Run `pull` to refresh Chatium sync checksums.
 5. Re-apply only the intended user change on top of the current server version. Preserve server-side edits.
@@ -57,11 +61,17 @@ If the intended resolution is ambiguous, stop and ask the user how exactly to re
 
 ## Command Behavior
 
-- `doctor`: verifies that `--cwd` is inside `~/Library/Application Support/Code/User/globalStorage/chatium.chatium-sync/<accountKey>` and that `configs/<accountKey>/tree.json` exists.
+- `doctor`: verifies that `--cwd` is inside the VS Code globalStorage Chatium sync directory for the current OS and that `configs/<accountKey>/tree.json` exists.
 - `init`: runs the same preflight, prompts the user for a token, saves it locally, and excludes `.chatium/` from git.
 - `pull`: downloads safe remote changes using the existing Chatium API and updates the VS Code extension `tree.json`.
 - `begin`: runs `pull`, initializes git in the sync root if needed, excludes local system paths, and creates a baseline commit.
 - `finish`: stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, and uploads only the diff from that new baseline. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
+
+The VS Code globalStorage root is resolved per OS:
+
+- macOS: `~/Library/Application Support/Code/User/globalStorage/chatium.chatium-sync`
+- Windows: `%APPDATA%\Code\User\globalStorage\chatium.chatium-sync`
+- Linux: `~/.config/Code/User/globalStorage/chatium.chatium-sync`
 
 All commands must fail outside a VS Code extension synced folder with:
 
@@ -77,6 +87,11 @@ Open this project through the Chatium VS Code extension first.
 - Stop on pre-existing both-changed conflicts before making user-requested edits.
 - If final stash reapply fails, keep the conflicted worktree and the stash, do not upload, and ask the user how to resolve the conflict.
 - If `finish` cannot reapply local changes on top of a newer server file, keep the server file on disk, save conflict artifacts under `.chatium/conflicts/`, and report the path.
+
+## Installation
+
+- **Codex**: the `agents/openai.yaml` file is recognised by Codex when the skill folder is placed in a Codex-discoverable skills location.
+- **Claude Code**: copy or symlink the `chatium/` folder into `~/.claude/skills/chatium/` (the folder that already contains `SKILL.md`). Claude Code auto-loads skills from there.
 
 ## Reference
 
