@@ -18,11 +18,15 @@ import path from 'node:path'
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? '0'
 
 const source = 'manual-user-provided-token'
-const authFileName = 'codex-auth.json'
-const stateFileName = 'codex-state.json'
+const authFileName = 'auth.json'
+const stateFileName = 'state.json'
+const legacyAuthFileName = 'codex-auth.json'
+const legacyStateFileName = 'codex-state.json'
 const failureOpenInVscode = 'Open this project through the Chatium VS Code extension first.'
-const baselineMessage = 'chatium baseline before codex work'
+const baselineMessage = 'chatium baseline before agent work'
 const finishStashMessage = 'chatium local changes before finish refresh'
+const gitAuthorName = 'Chatium Sync'
+const gitAuthorEmail = 'chatium-sync@local'
 
 type Entity = {
   id: string
@@ -65,9 +69,11 @@ type StateFile = {
 type Env = {
   accountKey: string
   authPath: string
+  legacyAuthPath: string
   configDir: string
   cwd: string
   statePath: string
+  legacyStatePath: string
   storageRoot: string
   syncRoot: string
   treePath: string
@@ -155,7 +161,19 @@ Commands only work inside VS Code Chatium sync folders.`)
 }
 
 function defaultStorageRoot(): string {
-  return path.join(homedir(), 'Library/Application Support/Code/User/globalStorage/chatium.chatium-sync')
+  const override = process.env.CHATIUM_STORAGE_ROOT
+  if (override) {
+    return override
+  }
+  const home = homedir()
+  if (process.platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'chatium.chatium-sync')
+  }
+  if (process.platform === 'win32') {
+    const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming')
+    return path.join(appData, 'Code', 'User', 'globalStorage', 'chatium.chatium-sync')
+  }
+  return path.join(home, '.config', 'Code', 'User', 'globalStorage', 'chatium.chatium-sync')
 }
 
 function requireValue(value: string | undefined, name: string): string {
@@ -304,9 +322,11 @@ function preflight(args: CliArgs): Env {
   return {
     accountKey: match.accountKey,
     authPath: path.join(localDir, authFileName),
+    legacyAuthPath: path.join(localDir, legacyAuthFileName),
     configDir: match.configDir,
     cwd: args.cwd,
     statePath: path.join(localDir, stateFileName),
+    legacyStatePath: path.join(localDir, legacyStateFileName),
     storageRoot,
     syncRoot: match.syncRoot,
     treePath: match.treePath,
@@ -348,7 +368,9 @@ function redactEnv(env: Env) {
     syncRoot: env.syncRoot,
     treePath: env.treePath,
     authPath: env.authPath,
-    authExists: existsSync(env.authPath),
+    authExists: existsSync(env.authPath) || existsSync(env.legacyAuthPath),
+    platform: process.platform,
+    storageRoot: env.storageRoot,
   }
 }
 
@@ -357,24 +379,34 @@ function ensureLocalDir(env: Env) {
 }
 
 function readAuth(env: Env): AuthFile {
-  if (!existsSync(env.authPath)) {
+  const sourcePath = existsSync(env.authPath)
+    ? env.authPath
+    : existsSync(env.legacyAuthPath)
+      ? env.legacyAuthPath
+      : null
+  if (!sourcePath) {
     throw new Error(`Chatium auth is not initialized. Run "init" first.`)
   }
-  const auth = readJson<AuthFile>(env.authPath)
+  const auth = readJson<AuthFile>(sourcePath)
   if (auth.accountKey !== env.accountKey) {
     throw new Error(`Auth account ${auth.accountKey} does not match current account ${env.accountKey}`)
   }
   if (!auth.apiToken) {
-    throw new Error(`Auth file has no apiToken: ${env.authPath}`)
+    throw new Error(`Auth file has no apiToken: ${sourcePath}`)
   }
   return auth
 }
 
 function readState(env: Env): StateFile {
-  if (!existsSync(env.statePath)) {
+  const sourcePath = existsSync(env.statePath)
+    ? env.statePath
+    : existsSync(env.legacyStatePath)
+      ? env.legacyStatePath
+      : null
+  if (!sourcePath) {
     throw new Error(`Chatium baseline state is missing. Run "begin" first.`)
   }
-  const state = readJson<StateFile>(env.statePath)
+  const state = readJson<StateFile>(sourcePath)
   if (state.accountKey !== env.accountKey) {
     throw new Error(`State account ${state.accountKey} does not match current account ${env.accountKey}`)
   }
@@ -649,7 +681,7 @@ async function recoverAndRetryUpload(
   const basePath = path.join(conflictDir, 'base')
   const remotePath = path.join(conflictDir, 'remote')
   const mergedPath = path.join(conflictDir, 'merged')
-  const patchPath = path.join(conflictDir, 'codex.patch')
+  const patchPath = path.join(conflictDir, 'local.patch')
 
   writeFileSync(oursPath, readFileSync(filePath))
 
@@ -839,7 +871,7 @@ function commitBaseline(env: Env) {
     staged.status === 0
       ? ['commit', '--allow-empty', '-m', baselineMessage]
       : ['commit', '-m', baselineMessage]
-  git(env.syncRoot, ['-c', 'user.name=Codex', '-c', 'user.email=codex@local', ...commitArgs])
+  git(env.syncRoot, ['-c', `user.name=${gitAuthorName}`, '-c', `user.email=${gitAuthorEmail}`, ...commitArgs])
 }
 
 function stashLocalChanges(env: Env): FinishStash | null {

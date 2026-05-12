@@ -4,17 +4,13 @@ This reference is derived from the current `chatium-sync` VS Code extension.
 
 ## Local Layout
 
-The skill only works inside a folder already synchronized by the VS Code extension:
+The skill only works inside a folder already synchronized by the VS Code extension. The VS Code globalStorage root is resolved per OS:
 
-```text
-~/Library/Application Support/Code/User/globalStorage/chatium.chatium-sync/<accountKey>
-```
+- macOS: `~/Library/Application Support/Code/User/globalStorage/chatium.chatium-sync`
+- Windows: `%APPDATA%\Code\User\globalStorage\chatium.chatium-sync`
+- Linux: `~/.config/Code/User/globalStorage/chatium.chatium-sync`
 
-The extension keeps sync metadata separately:
-
-```text
-~/Library/Application Support/Code/User/globalStorage/chatium.chatium-sync/configs/<accountKey>/tree.json
-```
+The synced project folder is `<storageRoot>/<accountKey>` and the extension keeps sync metadata separately at `<storageRoot>/configs/<accountKey>/tree.json`.
 
 For account keys with a path suffix, the source folder uses the extension convention:
 
@@ -24,9 +20,11 @@ accountKey.replace('/', '.')
 
 The config folder keeps the slash path under `configs/`.
 
-## Local Codex Files
+The helper script also honors the `CHATIUM_STORAGE_ROOT` environment variable for non-default VS Code installations (Insiders, VSCodium, portable installs).
 
-Codex stores local-only data in:
+## Local Skill Files
+
+The skill stores local-only data in:
 
 ```text
 <syncRoot>/.chatium/
@@ -34,9 +32,11 @@ Codex stores local-only data in:
 
 This path is ignored by the extension sync logic and must be excluded from git. It contains:
 
-- `codex-auth.json`: user-provided token.
-- `codex-state.json`: baseline commit information.
-- `conflicts/`: saved conflict artifacts.
+- `auth.json` (legacy: `codex-auth.json`): user-provided token.
+- `state.json` (legacy: `codex-state.json`): baseline commit information.
+- `conflicts/`: saved conflict artifacts (`local.patch`, legacy: `codex.patch`).
+
+The script reads either the new or legacy filename, so existing installs keep working.
 
 ## System Paths
 
