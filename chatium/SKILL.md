@@ -21,20 +21,33 @@ npx -y tsx /path/to/chatium/scripts/chatium-sync.ts <command> --cwd "$PWD"
 
 On Windows PowerShell use `${PWD}` instead of `"$PWD"`.
 
-Always run:
+Always start with `begin` before reading, searching, opening, planning, or
+editing project source files in a Chatium-synced project. `begin` verifies that
+the current folder belongs to a VS Code Chatium sync root, pulls the latest
+server code, refreshes generated typings in `node_modules`, initializes the
+local git baseline when needed, and creates the task baseline.
 
-1. `doctor` when you need to inspect whether the folder is a valid Chatium sync root.
-2. `init` once per synced account folder to store the user-provided token in `<syncRoot>/.chatium/auth.json`.
-3. `begin` before reading, searching, opening, or planning from project source files in a Chatium-synced project. This pulls the latest server code, refreshes generated typings in `node_modules`, and creates the planning baseline.
-4. Run `begin` again immediately before editing files for the user. This refreshes to the latest server code, refreshes generated typings again, and creates the implementation baseline.
-5. Make the requested local code changes.
-6. `finish` after local changes are complete.
+Do not run `doctor` or `init` proactively on every request. Use them only to
+recover from an explicit `begin` failure:
 
-Do not run `begin`, `pull`, or `finish` if `init` has not stored auth yet.
+- If `begin` says the project must be opened through the Chatium VS Code
+  extension first, stop source inspection and help the user fix that sync setup.
+- If `begin` says Chatium auth is not initialized, run `init` once for that
+  synced account folder, then rerun `begin`.
+- If `begin` reports a Chatium sync conflict, stop before planning or editing
+  and ask the user how to resolve it.
 
-After this skill triggers, treat source inspection as planning. Do not run `rg`, `sed`, `cat`, `ls`, open component files, inspect tests, or otherwise read project source before `begin` succeeds. The only allowed pre-`begin` actions are reading this skill, running `doctor`, and running `init` when auth is missing.
+After `begin` succeeds:
 
-If `begin` reports a Chatium sync conflict, stop before planning or editing and ask the user how to resolve it.
+1. Make the requested local code changes.
+2. Run the smallest relevant validation.
+3. Run `finish` after local changes are complete.
+
+After this skill triggers, treat source inspection as planning. Do not run
+`rg`, `sed`, `cat`, `ls`, open component files, inspect tests, or otherwise
+read project source before `begin` succeeds. The only allowed pre-`begin`
+actions are reading this skill and running `begin`; run `doctor` or `init` only
+when needed to handle the specific `begin` error.
 
 ## Recovering from finish conflicts
 
