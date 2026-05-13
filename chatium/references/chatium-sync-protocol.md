@@ -56,6 +56,7 @@ Never upload or inspect these as Chatium source files:
 The helper mirrors the VS Code extension `MonacoDocsSyncer` for generated typings:
 
 - `begin` refreshes typings every time after `pull` and before the git baseline.
+- `continue` is for continuing work after an existing git baseline; it stashes current local work before `pull`, refreshes typings and the baseline from the latest server state, then reapplies the stash so ongoing task edits remain outside the baseline.
 - `typings` can be run directly to refresh only generated typings.
 - The helper calls `GET /s/entity/monaco-get-all-builtin-content`.
 - The response `deps` map is written under `<syncRoot>/node_modules`.

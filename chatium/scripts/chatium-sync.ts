@@ -24,6 +24,7 @@ const legacyAuthFileName = 'codex-auth.json'
 const legacyStateFileName = 'codex-state.json'
 const failureOpenInVscode = 'Open this project through the Chatium VS Code extension first.'
 const baselineMessage = 'chatium baseline before agent work'
+const continueStashMessage = 'chatium local changes before continue refresh'
 const finishStashMessage = 'chatium local changes before finish refresh'
 const gitAuthorName = 'Chatium Sync'
 const gitAuthorEmail = 'chatium-sync@local'
@@ -107,7 +108,7 @@ type CliArgs = {
   cwd: string
 }
 
-type FinishStash = {
+type LocalChangesStash = {
   commit: string
   ref: 'stash@{0}'
 }
@@ -132,6 +133,8 @@ async function main() {
       return typingsCommand(args)
     case 'begin':
       return begin(args)
+    case 'continue':
+      return continueCommand(args)
     case 'finish':
       return finish(args)
     case 'help':
@@ -169,6 +172,7 @@ function printHelp() {
   npx -y tsx chatium/scripts/chatium-sync.ts pull [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts typings [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts begin [--cwd DIR]
+  npx -y tsx chatium/scripts/chatium-sync.ts continue [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts finish [--cwd DIR]
 
 Commands only work inside VS Code Chatium sync folders.`)
@@ -247,6 +251,7 @@ async function typingsCommand(args: CliArgs) {
 async function begin(args: CliArgs) {
   const env = preflight(args)
   const auth = readAuth(env)
+
   await pull(env, auth)
 
   ensureGitRepo(env.syncRoot)
@@ -257,6 +262,34 @@ async function begin(args: CliArgs) {
   console.log(`Baseline commit: ${baselineCommit}`)
 }
 
+async function continueCommand(args: CliArgs) {
+  const env = preflight(args)
+  const auth = readAuth(env)
+  return refreshBaselineKeepingCurrent(env, auth)
+}
+
+async function refreshBaselineKeepingCurrent(env: Env, auth: AuthFile) {
+  ensureGitRepo(env.syncRoot)
+  ensureGitExcludeIfRepo(env.syncRoot)
+  const stash = stashCurrentChangesForContinue(env)
+
+  try {
+    await pull(env, auth)
+    const written = await refreshGeneratedTypings(env, auth)
+    console.log(`Refreshed generated typings (${written} file(s)).`)
+    const baselineCommit = createAndStoreBaseline(env)
+    console.log(`Baseline commit: ${baselineCommit}`)
+
+    if (stash) {
+      applyContinueStash(env, stash)
+      dropLocalChangesStash(env, stash)
+      console.log('Reapplied local changes after baseline refresh.')
+    }
+  } catch (error) {
+    throw withPreservedStashMessage(error, stash, 'continue')
+  }
+}
+
 async function finish(args: CliArgs) {
   const env = preflight(args)
   const auth = readAuth(env)
@@ -264,7 +297,7 @@ async function finish(args: CliArgs) {
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
 
-  const stash = stashLocalChanges(env)
+  const stash = stashLocalChanges(env, finishStashMessage)
   let baselineCommit: string
 
   try {
@@ -273,10 +306,10 @@ async function finish(args: CliArgs) {
 
     if (stash) {
       applyFinishStash(env, stash)
-      dropFinishStash(env, stash)
+      dropLocalChangesStash(env, stash)
     }
   } catch (error) {
-    throw withPreservedStashMessage(error, stash)
+    throw withPreservedStashMessage(error, stash, 'finish')
   }
 
   const changes = getChangesSinceBaseline(env, baselineCommit)
@@ -967,9 +1000,25 @@ function commitBaseline(env: Env) {
   git(env.syncRoot, ['-c', `user.name=${gitAuthorName}`, '-c', `user.email=${gitAuthorEmail}`, ...commitArgs])
 }
 
-function stashLocalChanges(env: Env): FinishStash | null {
+function stashCurrentChangesForContinue(env: Env): LocalChangesStash | null {
+  if (!getShortGitStatus(env)) {
+    return null
+  }
+  requireGitHeadForStash(env)
+  return stashLocalChanges(env, continueStashMessage)
+}
+
+function requireGitHeadForStash(env: Env) {
+  const head = git(env.syncRoot, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
+  if (head.status === 0) {
+    return
+  }
+  throw new Error(`Cannot use "continue" before a git baseline exists. Run "begin" for a new task.`)
+}
+
+function stashLocalChanges(env: Env, message: string): LocalChangesStash | null {
   const before = revParseStash(env)
-  const result = git(env.syncRoot, ['stash', 'push', '--include-untracked', '-m', finishStashMessage, '--', '.'], {
+  const result = git(env.syncRoot, ['stash', 'push', '--include-untracked', '-m', message, '--', '.'], {
     allowFailure: true,
   })
 
@@ -985,12 +1034,29 @@ function stashLocalChanges(env: Env): FinishStash | null {
   return { commit: after, ref: 'stash@{0}' }
 }
 
-function applyFinishStash(env: Env, stash: FinishStash) {
+function applyContinueStash(env: Env, stash: LocalChangesStash) {
   const result = git(env.syncRoot, ['stash', 'apply', stash.ref], { allowFailure: true })
   if (result.status === 0) {
     return
   }
 
+  throw new Error(
+    `Cannot reapply stashed local changes after continue refresh.\n${describeStashApplyFailure(env, result)}\nStash kept as ${stash.ref} (${stash.commit}). Resolve this conflict before continuing task work.`,
+  )
+}
+
+function applyFinishStash(env: Env, stash: LocalChangesStash) {
+  const result = git(env.syncRoot, ['stash', 'apply', stash.ref], { allowFailure: true })
+  if (result.status === 0) {
+    return
+  }
+
+  throw new Error(
+    `Cannot reapply stashed local changes over latest server version.\n${describeStashApplyFailure(env, result)}\nStash kept as ${stash.ref} (${stash.commit}). Do not upload local changes. Ask the user how to resolve this conflict before editing or retrying finish.`,
+  )
+}
+
+function describeStashApplyFailure(env: Env, result: ReturnType<typeof git>): string {
   const conflicts = getConflictedPaths(env)
   const conflictDetails =
     conflicts.length > 0
@@ -998,13 +1064,10 @@ function applyFinishStash(env: Env, stash: FinishStash) {
       : `Git status:\n${getShortGitStatus(env) || '(no conflicted paths reported by git)'}`
   const gitOutput = (result.stderr || result.stdout).trim()
   const outputDetails = gitOutput ? `\n\nGit output:\n${gitOutput}` : ''
-
-  throw new Error(
-    `Cannot reapply stashed local changes over latest server version.\n${conflictDetails}\nStash kept as ${stash.ref} (${stash.commit}). Do not upload local changes. Ask the user how to resolve this conflict before editing or retrying finish.${outputDetails}`,
-  )
+  return `${conflictDetails}${outputDetails}`
 }
 
-function dropFinishStash(env: Env, stash: FinishStash) {
+function dropLocalChangesStash(env: Env, stash: LocalChangesStash) {
   const top = revParseStash(env)
   if (!top) {
     return
@@ -1015,12 +1078,14 @@ function dropFinishStash(env: Env, stash: FinishStash) {
   git(env.syncRoot, ['stash', 'drop', stash.ref])
 }
 
-function withPreservedStashMessage(error: unknown, stash: FinishStash | null): Error {
+function withPreservedStashMessage(error: unknown, stash: LocalChangesStash | null, retryCommand: string): Error {
   const message = error instanceof Error ? error.message : String(error)
   if (!stash || message.includes('Stash kept as')) {
     return error instanceof Error ? error : new Error(message)
   }
-  return new Error(`${message}\nLocal changes are preserved in ${stash.ref} (${stash.commit}). Fix the problem, then run finish again.`)
+  return new Error(
+    `${message}\nLocal changes are preserved in ${stash.ref} (${stash.commit}). Fix the problem, then run ${retryCommand} again.`,
+  )
 }
 
 function revParseStash(env: Env): string | null {

@@ -21,23 +21,31 @@ npx -y tsx /path/to/chatium/scripts/chatium-sync.ts <command> --cwd "$PWD"
 
 On Windows PowerShell use `${PWD}` instead of `"$PWD"`.
 
-Always start with `begin` before reading, searching, opening, planning, or
-editing project source files in a Chatium-synced project. `begin` verifies that
-the current folder belongs to a VS Code Chatium sync root, pulls the latest
-server code, refreshes generated typings in `node_modules`, initializes the
-local git baseline when needed, and creates the task baseline.
+Always start with `begin` or `continue` before reading, searching, opening,
+planning, or editing project source files in a Chatium-synced project. For new
+work, run `begin`; it verifies that the current folder belongs to a VS Code
+Chatium sync root, pulls the latest server code, refreshes generated typings in
+`node_modules`, initializes the local git baseline when needed, and creates the
+task baseline.
+
+If the user is continuing an existing task or there may already be local task
+changes in the worktree, run `continue` instead of `begin`. This temporarily
+stashes current local changes, refreshes from Chatium, creates the new baseline
+from the refreshed server state, and then reapplies the local changes so they do
+not get committed into the baseline. Use `begin` for the first baseline of new
+work before making task edits.
 
 Do not run `doctor` or `init` proactively on every request. Use them only to
-recover from an explicit `begin` failure:
+recover from an explicit `begin` or `continue` failure:
 
-- If `begin` says the project must be opened through the Chatium VS Code
+- If `begin` or `continue` says the project must be opened through the Chatium VS Code
   extension first, stop source inspection and help the user fix that sync setup.
-- If `begin` says Chatium auth is not initialized, run `init` once for that
-  synced account folder, then rerun `begin`.
-- If `begin` reports a Chatium sync conflict, stop before planning or editing
+- If `begin` or `continue` says Chatium auth is not initialized, run `init` once
+  for that synced account folder, then rerun the original start command.
+- If `begin` or `continue` reports a Chatium sync conflict, stop before planning or editing
   and ask the user how to resolve it.
 
-After `begin` succeeds:
+After `begin` or `continue` succeeds:
 
 1. Make the requested local code changes.
 2. Run the smallest relevant validation.
@@ -45,9 +53,13 @@ After `begin` succeeds:
 
 After this skill triggers, treat source inspection as planning. Do not run
 `rg`, `sed`, `cat`, `ls`, open component files, inspect tests, or otherwise
-read project source before `begin` succeeds. The only allowed pre-`begin`
-actions are reading this skill and running `begin`; run `doctor` or `init` only
-when needed to handle the specific `begin` error.
+read project source before `begin` or `continue` succeeds. The only allowed
+pre-start actions are reading this skill and running `begin` or `continue`; run
+`doctor` or `init` only when needed to handle the specific start error.
+
+If `continue` fails with `Cannot reapply stashed local changes after continue refresh`,
+do not keep editing. Inspect the conflicted files reported by git and ask the
+user how to resolve the local task changes against the refreshed server version.
 
 ## Recovering from finish conflicts
 
@@ -78,7 +90,8 @@ If the intended resolution is ambiguous, stop and ask the user how exactly to re
 - `init`: runs the same preflight, prompts the user for a token, saves it locally, and excludes `.chatium/` from git.
 - `pull`: downloads safe remote changes using the existing Chatium API and updates the VS Code extension `tree.json`.
 - `typings`: recreates generated `node_modules` typings from the Monaco docs endpoint and writes generated `tsconfig.json` / `package.json` when the backend returns them.
-- `begin`: runs `pull`, initializes git in the sync root if needed, excludes local system paths, runs `typings`, and creates a baseline commit.
+- `begin`: runs `pull`, initializes git in the sync root if needed, excludes local system paths, runs `typings`, and creates a baseline commit for new work.
+- `continue`: for continuing work after an existing baseline; stashes current local changes, runs the same refresh and baseline flow as `begin`, then reapplies the stashed changes so they stay outside the new baseline.
 - `finish`: stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, and uploads only the diff from that new baseline. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
 
 The VS Code globalStorage root is resolved per OS:
