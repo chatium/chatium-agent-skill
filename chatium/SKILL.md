@@ -26,14 +26,18 @@ planning, or editing project source files in a Chatium-synced project. For new
 work, run `begin`; it verifies that the current folder belongs to a VS Code
 Chatium sync root, pulls the latest server code, refreshes generated typings in
 `node_modules`, initializes the local git baseline when needed, and creates the
-task baseline.
+task baseline. At the very start of a new user task, `begin` is allowed even if
+the worktree already has local changes and even if the agent is in planning
+mode; running `begin` is the prerequisite that makes safe planning possible.
+Those pre-existing local changes become part of the new baseline, not part of
+the task diff uploaded by `finish`.
 
-If the user is continuing an existing task or there may already be local task
-changes in the worktree, run `continue` instead of `begin`. This temporarily
-stashes current local changes, refreshes from Chatium, creates the new baseline
-from the refreshed server state, and then reapplies the local changes so they do
-not get committed into the baseline. Use `begin` for the first baseline of new
-work before making task edits.
+If the user is continuing an existing task and the worktree may already contain
+local task changes that must remain outside the baseline, run `continue`
+instead of `begin`. This temporarily stashes current local changes, refreshes
+from Chatium, creates the new baseline from the refreshed server state, and then
+reapplies the local changes so they do not get committed into the baseline. Use
+`begin` for the first baseline of new work before making task edits.
 
 Do not run `doctor` or `init` proactively on every request. Use them only to
 recover from an explicit `begin` or `continue` failure:
