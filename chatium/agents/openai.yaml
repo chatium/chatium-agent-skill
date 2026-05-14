@@ -1,4 +1,4 @@
 interface:
   display_name: "Chatium"
   short_description: "Work safely in Chatium projects synced by the VS Code extension."
-  default_prompt: "Use the Chatium skill to run begin before planning new work, even with local changes; use continue only when resuming task changes that must stay outside the baseline."
+  default_prompt: "Use the Chatium skill flow strictly: for a new task run begin exactly once and never continue; when resuming the same task run continue and never begin."

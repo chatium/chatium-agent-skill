@@ -21,23 +21,32 @@ npx -y tsx /path/to/chatium/scripts/chatium-sync.ts <command> --cwd "$PWD"
 
 On Windows PowerShell use `${PWD}` instead of `"$PWD"`.
 
-Always start with `begin` or `continue` before reading, searching, opening,
-planning, or editing project source files in a Chatium-synced project. For new
-work, run `begin`; it verifies that the current folder belongs to a VS Code
-Chatium sync root, pulls the latest server code, refreshes generated typings in
-`node_modules`, initializes the local git baseline when needed, and creates the
-task baseline. At the very start of a new user task, `begin` is allowed even if
-the worktree already has local changes and even if the agent is in planning
-mode; running `begin` is the prerequisite that makes safe planning possible.
-Those pre-existing local changes become part of the new baseline, not part of
-the task diff uploaded by `finish`.
+Always start with exactly one of `begin` or `continue` before reading,
+searching, opening, planning, or editing project source files in a
+Chatium-synced project. Choose the command by task lifecycle:
 
-If the user is continuing an existing task and the worktree may already contain
-local task changes that must remain outside the baseline, run `continue`
-instead of `begin`. This temporarily stashes current local changes, refreshes
-from Chatium, creates the new baseline from the refreshed server state, and then
-reapplies the local changes so they do not get committed into the baseline. Use
-`begin` for the first baseline of new work before making task edits.
+- New task: always run `begin` and never run `continue`. `begin` verifies that
+  the current folder belongs to a VS Code Chatium sync root, pulls the latest
+  server code, refreshes generated typings in `node_modules`, initializes the
+  local git baseline when needed, and creates the task baseline. At the very
+  start of a new user task, `begin` is allowed even if the worktree already has
+  local changes and even if the agent is in planning mode; running `begin` is
+  the prerequisite that makes safe planning possible. Those pre-existing local
+  changes become part of the new baseline, not part of the task diff uploaded by
+  `finish`.
+- Continuing an existing task: always run `continue` and never run `begin`.
+  This applies when a previous turn or agent process already ran `begin` for
+  the same task, especially when the worktree may contain local task changes
+  that must remain outside the baseline. `continue` temporarily stashes current
+  local changes, refreshes from Chatium, creates the new baseline from the
+  refreshed server state, and then reapplies the local changes so they do not
+  get committed into the baseline.
+
+During one task, `begin` must be called strictly once: the first successful
+start command for new work. After `begin` succeeds, do not run `begin` again for
+that task. Use `continue` for any later resume or refresh of the same task, and
+use `finish` to complete the task. A later unrelated user task starts a new
+lifecycle and must call `begin` once.
 
 Do not run `doctor` or `init` proactively on every request. Use them only to
 recover from an explicit `begin` or `continue` failure:
@@ -94,9 +103,9 @@ If the intended resolution is ambiguous, stop and ask the user how exactly to re
 - `init`: runs the same preflight, prompts the user for a token, saves it locally, and excludes `.chatium/` from git.
 - `pull`: downloads safe remote changes using the existing Chatium API and updates the VS Code extension `tree.json`.
 - `typings`: recreates generated `node_modules` typings from the Monaco docs endpoint and writes generated `tsconfig.json` / `package.json` when the backend returns them.
-- `begin`: runs `pull`, initializes git in the sync root if needed, excludes local system paths, runs `typings`, and creates a baseline commit for new work.
-- `continue`: for continuing work after an existing baseline; stashes current local changes, runs the same refresh and baseline flow as `begin`, then reapplies the stashed changes so they stay outside the new baseline.
-- `finish`: stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, and uploads only the diff from that new baseline. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
+- `begin`: runs `pull`, initializes git in the sync root if needed, excludes local system paths, runs `typings`, creates a baseline commit for new work, and records an active task. It refuses to run while the current task is already active.
+- `continue`: for continuing work after an existing active task baseline; stashes current local changes, runs the same refresh and baseline flow as `begin`, then reapplies the stashed changes so they stay outside the new baseline. It refuses to run before `begin` or after the previous task was finished.
+- `finish`: stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, uploads only the diff from that new baseline, and marks the active task finished. It refuses to run before `begin` or after the previous task was already finished. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
 
 The VS Code globalStorage root is resolved per OS:
 

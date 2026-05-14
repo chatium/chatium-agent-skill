@@ -61,11 +61,19 @@ type AuthFile = {
   source: typeof source
 }
 
+type TaskCommand = 'begin' | 'continue' | 'finish'
+
 type StateFile = {
   accountKey: string
   baselineCommit: string
   createdAt: string
+  lastCommand?: TaskCommand
+  taskActive?: boolean
+  taskStartedAt?: string
+  taskUpdatedAt?: string
 }
+
+type TaskStateFields = Required<Pick<StateFile, 'lastCommand' | 'taskActive' | 'taskStartedAt' | 'taskUpdatedAt'>>
 
 type Env = {
   accountKey: string
@@ -250,6 +258,7 @@ async function typingsCommand(args: CliArgs) {
 
 async function begin(args: CliArgs) {
   const env = preflight(args)
+  assertBeginAllowed(env)
   const auth = readAuth(env)
 
   await pull(env, auth)
@@ -258,17 +267,18 @@ async function begin(args: CliArgs) {
   ensureGitExcludeIfRepo(env.syncRoot)
   const written = await refreshGeneratedTypings(env, auth)
   console.log(`Refreshed generated typings (${written} file(s)).`)
-  const baselineCommit = createAndStoreBaseline(env)
+  const baselineCommit = createAndStoreBaseline(env, taskStateForNewBegin())
   console.log(`Baseline commit: ${baselineCommit}`)
 }
 
 async function continueCommand(args: CliArgs) {
   const env = preflight(args)
+  const state = assertContinueAllowed(env)
   const auth = readAuth(env)
-  return refreshBaselineKeepingCurrent(env, auth)
+  return refreshBaselineKeepingCurrent(env, auth, taskStateForActiveCommand(state, 'continue'))
 }
 
-async function refreshBaselineKeepingCurrent(env: Env, auth: AuthFile) {
+async function refreshBaselineKeepingCurrent(env: Env, auth: AuthFile, taskState: TaskStateFields) {
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
   const stash = stashCurrentChangesForContinue(env)
@@ -277,7 +287,7 @@ async function refreshBaselineKeepingCurrent(env: Env, auth: AuthFile) {
     await pull(env, auth)
     const written = await refreshGeneratedTypings(env, auth)
     console.log(`Refreshed generated typings (${written} file(s)).`)
-    const baselineCommit = createAndStoreBaseline(env)
+    const baselineCommit = createAndStoreBaseline(env, taskState)
     console.log(`Baseline commit: ${baselineCommit}`)
 
     if (stash) {
@@ -292,8 +302,8 @@ async function refreshBaselineKeepingCurrent(env: Env, auth: AuthFile) {
 
 async function finish(args: CliArgs) {
   const env = preflight(args)
+  const state = assertFinishAllowed(env)
   const auth = readAuth(env)
-  readState(env)
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
 
@@ -302,7 +312,7 @@ async function finish(args: CliArgs) {
 
   try {
     await pull(env, auth)
-    baselineCommit = createAndStoreBaseline(env)
+    baselineCommit = createAndStoreBaseline(env, taskStateForActiveCommand(state, 'finish'))
 
     if (stash) {
       applyFinishStash(env, stash)
@@ -315,6 +325,7 @@ async function finish(args: CliArgs) {
   const changes = getChangesSinceBaseline(env, baselineCommit)
 
   if (changes.length === 0) {
+    markTaskFinished(env, baselineCommit)
     console.log('No local changes since Chatium baseline.')
     return
   }
@@ -342,6 +353,7 @@ async function finish(args: CliArgs) {
   }
 
   saveTree(env, tree)
+  markTaskFinished(env, baselineCommit)
   console.log(`Uploaded ${changes.length} change(s) to Chatium.`)
 }
 
@@ -454,20 +466,103 @@ function readAuth(env: Env): AuthFile {
   return auth
 }
 
-function readState(env: Env): StateFile {
-  const sourcePath = existsSync(env.statePath)
+function stateSourcePath(env: Env): string | null {
+  return existsSync(env.statePath)
     ? env.statePath
     : existsSync(env.legacyStatePath)
       ? env.legacyStatePath
       : null
+}
+
+function readOptionalState(env: Env): StateFile | null {
+  const sourcePath = stateSourcePath(env)
   if (!sourcePath) {
-    throw new Error(`Chatium baseline state is missing. Run "begin" first.`)
+    return null
   }
   const state = readJson<StateFile>(sourcePath)
   if (state.accountKey !== env.accountKey) {
     throw new Error(`State account ${state.accountKey} does not match current account ${env.accountKey}`)
   }
   return state
+}
+
+function readState(env: Env): StateFile {
+  const state = readOptionalState(env)
+  if (!state) {
+    throw new Error(`Chatium baseline state is missing. Run "begin" first.`)
+  }
+  return state
+}
+
+function assertBeginAllowed(env: Env) {
+  const state = readOptionalState(env)
+  if (!state?.taskActive) {
+    return
+  }
+  throw new Error(
+    `Cannot run "begin" while a task is already active. "begin" must be called exactly once per task. Run "continue" if you are resuming this task, or "finish" before starting a new task.`,
+  )
+}
+
+function assertContinueAllowed(env: Env): StateFile {
+  const state = readState(env)
+  if (state.taskActive === false) {
+    throw new Error(`Cannot run "continue" after the previous task was finished. Run "begin" for a new task.`)
+  }
+  return state
+}
+
+function assertFinishAllowed(env: Env): StateFile {
+  const state = readState(env)
+  if (state.taskActive === false) {
+    throw new Error(`Cannot run "finish" after the previous task was already finished. Run "begin" for a new task.`)
+  }
+  return state
+}
+
+function taskStateForNewBegin(): TaskStateFields {
+  const now = new Date().toISOString()
+  return {
+    lastCommand: 'begin',
+    taskActive: true,
+    taskStartedAt: now,
+    taskUpdatedAt: now,
+  }
+}
+
+function taskStateForActiveCommand(state: StateFile, command: TaskCommand): TaskStateFields {
+  const now = new Date().toISOString()
+  return {
+    lastCommand: command,
+    taskActive: true,
+    taskStartedAt: state.taskStartedAt ?? state.createdAt ?? now,
+    taskUpdatedAt: now,
+  }
+}
+
+function taskStateForFinished(state: StateFile): TaskStateFields {
+  const now = new Date().toISOString()
+  return {
+    lastCommand: 'finish',
+    taskActive: false,
+    taskStartedAt: state.taskStartedAt ?? state.createdAt ?? now,
+    taskUpdatedAt: now,
+  }
+}
+
+function writeState(env: Env, state: StateFile) {
+  ensureLocalDir(env)
+  writeJson(env.statePath, state)
+  chmodSync(env.statePath, 0o600)
+}
+
+function markTaskFinished(env: Env, baselineCommit: string) {
+  const state = readState(env)
+  writeState(env, {
+    ...state,
+    baselineCommit,
+    ...taskStateForFinished(state),
+  })
 }
 
 async function pull(env: Env, auth: AuthFile): Promise<TreeFile> {
@@ -971,7 +1066,7 @@ function ensureGitExcludeIfRepo(syncRoot: string) {
   }
 }
 
-function createAndStoreBaseline(env: Env): string {
+function createAndStoreBaseline(env: Env, taskState: TaskStateFields): string {
   commitBaseline(env)
 
   const baselineCommit = git(env.syncRoot, ['rev-parse', 'HEAD']).stdout.trim()
@@ -979,9 +1074,9 @@ function createAndStoreBaseline(env: Env): string {
     accountKey: env.accountKey,
     baselineCommit,
     createdAt: new Date().toISOString(),
+    ...taskState,
   }
-  writeJson(env.statePath, state)
-  chmodSync(env.statePath, 0o600)
+  writeState(env, state)
   return baselineCommit
 }
 
