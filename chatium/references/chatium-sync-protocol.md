@@ -33,7 +33,7 @@ The skill stores local-only data in:
 This path is ignored by the extension sync logic and must be excluded from git. It contains:
 
 - `auth.json` (legacy: `codex-auth.json`): user-provided token.
-- `state.json` (legacy: `codex-state.json`): baseline commit information and active task lifecycle state.
+- `state.json` (legacy: `codex-state.json`): baseline commit information.
 - `conflicts/`: saved conflict artifacts (`local.patch`, legacy: `codex.patch`).
 
 The script reads either the new or legacy filename, so existing installs keep working.
@@ -55,11 +55,8 @@ Never upload or inspect these as Chatium source files:
 
 The helper mirrors the VS Code extension `MonacoDocsSyncer` for generated typings:
 
-- New task flow always starts with `begin`, never `continue`.
-- Continuing the same task always starts with `continue`, never `begin`.
-- During one task lifecycle, `begin` must be called exactly once. After `begin` succeeds, all later resumes or refreshes for that task must use `continue` until `finish` succeeds.
-- `begin` refreshes typings every time after `pull` and before the git baseline.
-- `continue` is for continuing work after an existing active task baseline; it stashes current local work before `pull`, refreshes typings and the baseline from the latest server state, then reapplies the stash so ongoing task edits remain outside the baseline.
+- `begin` is the only start/resume command. It stashes current local work before `pull`, refreshes typings and the baseline from the latest server state, then reapplies the stash so local edits remain uncommitted.
+- `finish` stashes current local work before `pull`, creates a fresh baseline from the latest server state, reapplies the stash, uploads the resulting diff, and leaves those local edits uncommitted for user review.
 - `typings` can be run directly to refresh only generated typings.
 - The helper calls `GET /s/entity/monaco-get-all-builtin-content`.
 - The response `deps` map is written under `<syncRoot>/node_modules`.

@@ -24,8 +24,9 @@ const legacyAuthFileName = 'codex-auth.json'
 const legacyStateFileName = 'codex-state.json'
 const failureOpenInVscode = 'Open this project through the Chatium VS Code extension first.'
 const baselineMessage = 'chatium baseline before agent work'
-const continueStashMessage = 'chatium local changes before continue refresh'
+const beginStashMessage = 'chatium local changes before begin refresh'
 const finishStashMessage = 'chatium local changes before finish refresh'
+const initialStashAnchorMessage = 'chatium initial empty baseline for stash'
 const gitAuthorName = 'Chatium Sync'
 const gitAuthorEmail = 'chatium-sync@local'
 
@@ -61,19 +62,11 @@ type AuthFile = {
   source: typeof source
 }
 
-type TaskCommand = 'begin' | 'continue' | 'finish'
-
 type StateFile = {
   accountKey: string
   baselineCommit: string
   createdAt: string
-  lastCommand?: TaskCommand
-  taskActive?: boolean
-  taskStartedAt?: string
-  taskUpdatedAt?: string
 }
-
-type TaskStateFields = Required<Pick<StateFile, 'lastCommand' | 'taskActive' | 'taskStartedAt' | 'taskUpdatedAt'>>
 
 type Env = {
   accountKey: string
@@ -141,8 +134,6 @@ async function main() {
       return typingsCommand(args)
     case 'begin':
       return begin(args)
-    case 'continue':
-      return continueCommand(args)
     case 'finish':
       return finish(args)
     case 'help':
@@ -175,13 +166,15 @@ function parseArgs(argv: string[]): CliArgs {
 
 function printHelp() {
   console.log(`Usage:
+Workflow commands:
+  npx -y tsx chatium/scripts/chatium-sync.ts begin [--cwd DIR]
+  npx -y tsx chatium/scripts/chatium-sync.ts finish [--cwd DIR]
+
+Support commands:
   npx -y tsx chatium/scripts/chatium-sync.ts doctor [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts init [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts pull [--cwd DIR]
   npx -y tsx chatium/scripts/chatium-sync.ts typings [--cwd DIR]
-  npx -y tsx chatium/scripts/chatium-sync.ts begin [--cwd DIR]
-  npx -y tsx chatium/scripts/chatium-sync.ts continue [--cwd DIR]
-  npx -y tsx chatium/scripts/chatium-sync.ts finish [--cwd DIR]
 
 Commands only work inside VS Code Chatium sync folders.`)
 }
@@ -258,61 +251,41 @@ async function typingsCommand(args: CliArgs) {
 
 async function begin(args: CliArgs) {
   const env = preflight(args)
-  assertBeginAllowed(env)
   const auth = readAuth(env)
-
-  await pull(env, auth)
-
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
-  const written = await refreshGeneratedTypings(env, auth)
-  console.log(`Refreshed generated typings (${written} file(s)).`)
-  const baselineCommit = createAndStoreBaseline(env, taskStateForNewBegin())
-  console.log(`Baseline commit: ${baselineCommit}`)
-}
-
-async function continueCommand(args: CliArgs) {
-  const env = preflight(args)
-  const state = assertContinueAllowed(env)
-  const auth = readAuth(env)
-  return refreshBaselineKeepingCurrent(env, auth, taskStateForActiveCommand(state, 'continue'))
-}
-
-async function refreshBaselineKeepingCurrent(env: Env, auth: AuthFile, taskState: TaskStateFields) {
-  ensureGitRepo(env.syncRoot)
-  ensureGitExcludeIfRepo(env.syncRoot)
-  const stash = stashCurrentChangesForContinue(env)
+  const stash = stashCurrentChanges(env, beginStashMessage)
 
   try {
     await pull(env, auth)
     const written = await refreshGeneratedTypings(env, auth)
     console.log(`Refreshed generated typings (${written} file(s)).`)
-    const baselineCommit = createAndStoreBaseline(env, taskState)
+    const baselineCommit = createAndStoreBaseline(env)
     console.log(`Baseline commit: ${baselineCommit}`)
 
     if (stash) {
-      applyContinueStash(env, stash)
+      applyBeginStash(env, stash)
       dropLocalChangesStash(env, stash)
       console.log('Reapplied local changes after baseline refresh.')
     }
   } catch (error) {
-    throw withPreservedStashMessage(error, stash, 'continue')
+    throw withPreservedStashMessage(error, stash, 'begin')
   }
 }
 
 async function finish(args: CliArgs) {
   const env = preflight(args)
-  const state = assertFinishAllowed(env)
+  readState(env)
   const auth = readAuth(env)
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
 
-  const stash = stashLocalChanges(env, finishStashMessage)
+  const stash = stashCurrentChanges(env, finishStashMessage)
   let baselineCommit: string
 
   try {
     await pull(env, auth)
-    baselineCommit = createAndStoreBaseline(env, taskStateForActiveCommand(state, 'finish'))
+    baselineCommit = createAndStoreBaseline(env)
 
     if (stash) {
       applyFinishStash(env, stash)
@@ -325,7 +298,6 @@ async function finish(args: CliArgs) {
   const changes = getChangesSinceBaseline(env, baselineCommit)
 
   if (changes.length === 0) {
-    markTaskFinished(env, baselineCommit)
     console.log('No local changes since Chatium baseline.')
     return
   }
@@ -353,7 +325,6 @@ async function finish(args: CliArgs) {
   }
 
   saveTree(env, tree)
-  markTaskFinished(env, baselineCommit)
   console.log(`Uploaded ${changes.length} change(s) to Chatium.`)
 }
 
@@ -474,10 +445,10 @@ function stateSourcePath(env: Env): string | null {
       : null
 }
 
-function readOptionalState(env: Env): StateFile | null {
+function readState(env: Env): StateFile {
   const sourcePath = stateSourcePath(env)
   if (!sourcePath) {
-    return null
+    throw new Error(`Chatium baseline state is missing. Run "begin" first.`)
   }
   const state = readJson<StateFile>(sourcePath)
   if (state.accountKey !== env.accountKey) {
@@ -486,83 +457,10 @@ function readOptionalState(env: Env): StateFile | null {
   return state
 }
 
-function readState(env: Env): StateFile {
-  const state = readOptionalState(env)
-  if (!state) {
-    throw new Error(`Chatium baseline state is missing. Run "begin" first.`)
-  }
-  return state
-}
-
-function assertBeginAllowed(env: Env) {
-  const state = readOptionalState(env)
-  if (!state?.taskActive) {
-    return
-  }
-  throw new Error(
-    `Cannot run "begin" while a task is already active. "begin" must be called exactly once per task. Run "continue" if you are resuming this task, or "finish" before starting a new task.`,
-  )
-}
-
-function assertContinueAllowed(env: Env): StateFile {
-  const state = readState(env)
-  if (state.taskActive === false) {
-    throw new Error(`Cannot run "continue" after the previous task was finished. Run "begin" for a new task.`)
-  }
-  return state
-}
-
-function assertFinishAllowed(env: Env): StateFile {
-  const state = readState(env)
-  if (state.taskActive === false) {
-    throw new Error(`Cannot run "finish" after the previous task was already finished. Run "begin" for a new task.`)
-  }
-  return state
-}
-
-function taskStateForNewBegin(): TaskStateFields {
-  const now = new Date().toISOString()
-  return {
-    lastCommand: 'begin',
-    taskActive: true,
-    taskStartedAt: now,
-    taskUpdatedAt: now,
-  }
-}
-
-function taskStateForActiveCommand(state: StateFile, command: TaskCommand): TaskStateFields {
-  const now = new Date().toISOString()
-  return {
-    lastCommand: command,
-    taskActive: true,
-    taskStartedAt: state.taskStartedAt ?? state.createdAt ?? now,
-    taskUpdatedAt: now,
-  }
-}
-
-function taskStateForFinished(state: StateFile): TaskStateFields {
-  const now = new Date().toISOString()
-  return {
-    lastCommand: 'finish',
-    taskActive: false,
-    taskStartedAt: state.taskStartedAt ?? state.createdAt ?? now,
-    taskUpdatedAt: now,
-  }
-}
-
 function writeState(env: Env, state: StateFile) {
   ensureLocalDir(env)
   writeJson(env.statePath, state)
   chmodSync(env.statePath, 0o600)
-}
-
-function markTaskFinished(env: Env, baselineCommit: string) {
-  const state = readState(env)
-  writeState(env, {
-    ...state,
-    baselineCommit,
-    ...taskStateForFinished(state),
-  })
 }
 
 async function pull(env: Env, auth: AuthFile): Promise<TreeFile> {
@@ -1066,7 +964,7 @@ function ensureGitExcludeIfRepo(syncRoot: string) {
   }
 }
 
-function createAndStoreBaseline(env: Env, taskState: TaskStateFields): string {
+function createAndStoreBaseline(env: Env): string {
   commitBaseline(env)
 
   const baselineCommit = git(env.syncRoot, ['rev-parse', 'HEAD']).stdout.trim()
@@ -1074,7 +972,6 @@ function createAndStoreBaseline(env: Env, taskState: TaskStateFields): string {
     accountKey: env.accountKey,
     baselineCommit,
     createdAt: new Date().toISOString(),
-    ...taskState,
   }
   writeState(env, state)
   return baselineCommit
@@ -1095,20 +992,29 @@ function commitBaseline(env: Env) {
   git(env.syncRoot, ['-c', `user.name=${gitAuthorName}`, '-c', `user.email=${gitAuthorEmail}`, ...commitArgs])
 }
 
-function stashCurrentChangesForContinue(env: Env): LocalChangesStash | null {
+function stashCurrentChanges(env: Env, message: string): LocalChangesStash | null {
   if (!getShortGitStatus(env)) {
     return null
   }
-  requireGitHeadForStash(env)
-  return stashLocalChanges(env, continueStashMessage)
+  ensureGitHeadForStash(env)
+  return stashLocalChanges(env, message)
 }
 
-function requireGitHeadForStash(env: Env) {
+function ensureGitHeadForStash(env: Env) {
   const head = git(env.syncRoot, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
   if (head.status === 0) {
     return
   }
-  throw new Error(`Cannot use "continue" before a git baseline exists. Run "begin" for a new task.`)
+  git(env.syncRoot, [
+    '-c',
+    `user.name=${gitAuthorName}`,
+    '-c',
+    `user.email=${gitAuthorEmail}`,
+    'commit',
+    '--allow-empty',
+    '-m',
+    initialStashAnchorMessage,
+  ])
 }
 
 function stashLocalChanges(env: Env, message: string): LocalChangesStash | null {
@@ -1129,14 +1035,17 @@ function stashLocalChanges(env: Env, message: string): LocalChangesStash | null 
   return { commit: after, ref: 'stash@{0}' }
 }
 
-function applyContinueStash(env: Env, stash: LocalChangesStash) {
+function applyBeginStash(env: Env, stash: LocalChangesStash) {
   const result = git(env.syncRoot, ['stash', 'apply', stash.ref], { allowFailure: true })
   if (result.status === 0) {
     return
   }
+  if (stashedUntrackedFilesAlreadyMatchWorktree(env, stash, result)) {
+    return
+  }
 
   throw new Error(
-    `Cannot reapply stashed local changes after continue refresh.\n${describeStashApplyFailure(env, result)}\nStash kept as ${stash.ref} (${stash.commit}). Resolve this conflict before continuing task work.`,
+    `Cannot reapply stashed local changes after begin refresh.\n${describeStashApplyFailure(env, result)}\nStash kept as ${stash.ref} (${stash.commit}). Resolve this conflict before continuing work.`,
   )
 }
 
@@ -1145,10 +1054,51 @@ function applyFinishStash(env: Env, stash: LocalChangesStash) {
   if (result.status === 0) {
     return
   }
+  if (stashedUntrackedFilesAlreadyMatchWorktree(env, stash, result)) {
+    return
+  }
 
   throw new Error(
     `Cannot reapply stashed local changes over latest server version.\n${describeStashApplyFailure(env, result)}\nStash kept as ${stash.ref} (${stash.commit}). Do not upload local changes. Ask the user how to resolve this conflict before editing or retrying finish.`,
   )
+}
+
+function stashedUntrackedFilesAlreadyMatchWorktree(
+  env: Env,
+  stash: LocalChangesStash,
+  result: ReturnType<typeof git>,
+): boolean {
+  const output = `${result.stderr}\n${result.stdout}`
+  if (!output.includes('could not restore untracked files') || getConflictedPaths(env).length > 0) {
+    return false
+  }
+
+  const untrackedTree = `${stash.ref}^3`
+  const tree = git(env.syncRoot, ['rev-parse', '--verify', untrackedTree], { allowFailure: true })
+  if (tree.status !== 0) {
+    return false
+  }
+
+  const files = git(env.syncRoot, ['ls-tree', '-r', '--name-only', untrackedTree], { allowFailure: true })
+    .stdout.split(/\r?\n/)
+    .map(normalizePath)
+    .filter(Boolean)
+  if (files.length === 0) {
+    return false
+  }
+
+  return files.every(itemPath => {
+    const localPath = path.join(env.syncRoot, itemPath)
+    if (!existsSync(localPath) || statSync(localPath).isDirectory()) {
+      return false
+    }
+    const stashedBlob = git(env.syncRoot, ['rev-parse', `${untrackedTree}:${itemPath}`], { allowFailure: true })
+    if (stashedBlob.status !== 0) {
+      return false
+    }
+    const localBlob = git(env.syncRoot, ['hash-object', '--', localPath], { allowFailure: true })
+    return localBlob.status === 0 && localBlob.stdout.trim() === stashedBlob.stdout.trim()
+  })
 }
 
 function describeStashApplyFailure(env: Env, result: ReturnType<typeof git>): string {
