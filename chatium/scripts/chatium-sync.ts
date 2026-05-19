@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
+  mkdtempSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -12,7 +13,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? '0'
@@ -112,6 +113,16 @@ type CliArgs = {
 type LocalChangesStash = {
   commit: string
   ref: 'stash@{0}'
+}
+
+type SyncedLocalChange = {
+  content: Buffer
+  path: string
+  syncedChecksum: string
+}
+
+type PullOptions = {
+  preserveSyncedLocalChanges?: Map<string, SyncedLocalChange>
 }
 
 main().catch(error => {
@@ -254,10 +265,11 @@ async function begin(args: CliArgs) {
   const auth = readAuth(env)
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
+  const preserveSyncedLocalChanges = captureSyncedLocalChanges(env)
   const stash = stashCurrentChanges(env, beginStashMessage)
 
   try {
-    await pull(env, auth)
+    await pull(env, auth, { preserveSyncedLocalChanges })
     const written = await refreshGeneratedTypings(env, auth)
     console.log(`Refreshed generated typings (${written} file(s)).`)
     const baselineCommit = createAndStoreBaseline(env)
@@ -280,11 +292,12 @@ async function finish(args: CliArgs) {
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
 
+  const preserveSyncedLocalChanges = captureSyncedLocalChanges(env)
   const stash = stashCurrentChanges(env, finishStashMessage)
   let baselineCommit: string
 
   try {
-    await pull(env, auth)
+    await pull(env, auth, { preserveSyncedLocalChanges })
     baselineCommit = createAndStoreBaseline(env)
 
     if (stash) {
@@ -463,7 +476,7 @@ function writeState(env: Env, state: StateFile) {
   chmodSync(env.statePath, 0o600)
 }
 
-async function pull(env: Env, auth: AuthFile): Promise<TreeFile> {
+async function pull(env: Env, auth: AuthFile, options: PullOptions = {}): Promise<TreeFile> {
   const tree = readTree(env)
   const remote = await fetchRemoteTree(env, auth, tree)
   const remoteItems = mapRemoteItems(remote.body.items)
@@ -506,6 +519,15 @@ async function pull(env: Env, auth: AuthFile): Promise<TreeFile> {
     }
 
     if (!localItem || !existsSync(localPath)) {
+      const preserved = options.preserveSyncedLocalChanges?.get(itemPath)
+      if (preserved && localItem?.syncedChecksum === preserved.syncedChecksum) {
+        if (remoteItem.checksum !== preserved.syncedChecksum) {
+          conflicts.push(`${itemPath}: changed locally and on server`)
+        } else {
+          tree.items[itemPath] = { ...remoteItem, state: 'needUpload', syncedChecksum: preserved.syncedChecksum }
+        }
+        continue
+      }
       await downloadFile(env, auth, remoteItem.id, localPath)
       tree.items[itemPath] = { ...remoteItem, state: 'synced', syncedChecksum: remoteItem.checksum }
       continue
@@ -520,6 +542,12 @@ async function pull(env: Env, auth: AuthFile): Promise<TreeFile> {
     } else if (remoteItem.checksum === localItem.syncedChecksum) {
       tree.items[itemPath] = { ...remoteItem, state: 'needUpload', syncedChecksum: localItem.syncedChecksum }
     } else {
+      const preserved = options.preserveSyncedLocalChanges?.get(itemPath)
+      if (preserved && preserved.syncedChecksum === localItem.syncedChecksum) {
+        await applyRemoteChangeOverPreservedBaseline(env, auth, preserved, remoteItem)
+        tree.items[itemPath] = { ...remoteItem, state: 'synced', syncedChecksum: remoteItem.checksum }
+        continue
+      }
       tree.items[itemPath] = { ...remoteItem, state: 'changedLocally', syncedChecksum: localItem.syncedChecksum }
       conflicts.push(`${itemPath}: changed locally and on server`)
     }
@@ -533,6 +561,82 @@ async function pull(env: Env, auth: AuthFile): Promise<TreeFile> {
   }
 
   return tree
+}
+
+function captureSyncedLocalChanges(env: Env): Map<string, SyncedLocalChange> {
+  const result = new Map<string, SyncedLocalChange>()
+  const head = git(env.syncRoot, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
+  if (head.status !== 0) {
+    return result
+  }
+
+  const tree = readTree(env)
+  for (const change of getChangesSinceBaseline(env, head.stdout.trim())) {
+    const itemPath = change.path
+    if (isSystemPath(itemPath) || change.status === 'D') {
+      continue
+    }
+
+    const localItem = tree.items?.[itemPath]
+    const localPath = path.join(env.syncRoot, itemPath)
+    if (!localItem?.syncedChecksum || localItem.isDirectory || !existsSync(localPath) || statSync(localPath).isDirectory()) {
+      continue
+    }
+
+    if (sha1File(localPath) === localItem.syncedChecksum) {
+      result.set(itemPath, {
+        content: readFileSync(localPath),
+        path: itemPath,
+        syncedChecksum: localItem.syncedChecksum,
+      })
+    }
+  }
+  return result
+}
+
+async function applyRemoteChangeOverPreservedBaseline(
+  env: Env,
+  auth: AuthFile,
+  preserved: SyncedLocalChange,
+  remoteItem: Entity,
+) {
+  const localPath = path.join(env.syncRoot, preserved.path)
+  if (!existsSync(localPath) || statSync(localPath).isDirectory()) {
+    throw new Error(`${preserved.path}: changed locally and on server`)
+  }
+
+  const currentContent = readFileSync(localPath)
+  if (!looksUtf8(currentContent) || !looksUtf8(preserved.content)) {
+    throw new Error(`${preserved.path}: changed locally and on server; automatic baseline merge only supports text files`)
+  }
+
+  const remote = await fetchFileSource(env, auth, remoteItem.id)
+  const remoteContent = Buffer.from(remote.source ?? '', 'utf8')
+  const merged = mergeFileContents(preserved.path, currentContent, preserved.content, remoteContent)
+  writeFileSync(localPath, merged, 'utf8')
+}
+
+function mergeFileContents(itemPath: string, current: Buffer, base: Buffer, remote: Buffer): string {
+  const mergeDir = mkdtempSync(path.join(tmpdir(), 'chatium-merge-'))
+  try {
+    const currentPath = path.join(mergeDir, 'current')
+    const basePath = path.join(mergeDir, 'base')
+    const remotePath = path.join(mergeDir, 'remote')
+    writeFileSync(currentPath, current)
+    writeFileSync(basePath, base)
+    writeFileSync(remotePath, remote)
+
+    const merge = spawnSync('git', ['merge-file', '-p', currentPath, basePath, remotePath], {
+      cwd: mergeDir,
+      encoding: 'utf8',
+    })
+    if (merge.status !== 0) {
+      throw new Error(`${itemPath}: cannot merge latest server change while preserving local git diff`)
+    }
+    return merge.stdout
+  } finally {
+    rmSync(mergeDir, { force: true, recursive: true })
+  }
 }
 
 function readTree(env: Env): TreeFile {
@@ -627,7 +731,7 @@ function resolveGeneratedTypingPath(nodeModulesRoot: string, key: string, isFile
   return filePath
 }
 
-async function downloadFile(env: Env, auth: AuthFile, id: string, filePath: string): Promise<Entity | undefined> {
+async function fetchFileSource(env: Env, auth: AuthFile, id: string): Promise<{ source?: string; entity?: Entity }> {
   const tree = readTree(env)
   const response = await requestJson<{ source: string; entity?: Entity }>(
     env,
@@ -636,9 +740,14 @@ async function downloadFile(env: Env, auth: AuthFile, id: string, filePath: stri
     { method: 'GET' },
     tree,
   )
+  return response.body
+}
+
+async function downloadFile(env: Env, auth: AuthFile, id: string, filePath: string): Promise<Entity | undefined> {
+  const response = await fetchFileSource(env, auth, id)
   mkdirSync(path.dirname(filePath), { recursive: true })
-  writeFileSync(filePath, response.body.source ?? '', 'utf8')
-  return response.body.entity
+  writeFileSync(filePath, response.source ?? '', 'utf8')
+  return response.entity
 }
 
 async function uploadRename(

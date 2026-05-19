@@ -1,4 +1,4 @@
 interface:
   display_name: "Chatium"
   short_description: "Work safely in Chatium projects synced by the VS Code extension."
-  default_prompt: "Use the Chatium skill flow strictly: always run begin before source inspection; begin preserves current local changes, refreshes the server baseline, and reapplies them; run finish after edits to upload while leaving local changes uncommitted for review."
+  default_prompt: "Use the Chatium skill flow: read-only source inspection is allowed before begin; run begin before edits to preserve current local changes, refresh the server baseline, and reapply them; run finish after edits to upload while leaving local changes uncommitted for review."

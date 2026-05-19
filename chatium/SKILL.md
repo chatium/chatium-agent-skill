@@ -1,6 +1,6 @@
 ---
 name: chatium
-description: Work safely in Chatium projects that are already synchronized by the Chatium VS Code extension. Use when the assistant (Codex, Claude Code, or any other agent) reads, searches, plans, or edits local files under VS Code globalStorage/chatium.chatium-sync account folders, must pull external Chatium changes before inspecting project source, create a local git baseline, and publish local file changes back to Chatium through existing entity APIs. Do not use outside a folder already synced by the VS Code extension.
+description: Work safely in Chatium projects that are already synchronized by the Chatium VS Code extension. Use when the assistant (Codex, Claude Code, or any other agent) reads, searches, plans, or edits local files under VS Code globalStorage/chatium.chatium-sync account folders, may inspect local source read-only before starting, must run begin before edits to refresh the server baseline, and publishes local file changes back to Chatium through existing entity APIs. Do not use outside a folder already synced by the VS Code extension.
 ---
 
 # Chatium
@@ -21,16 +21,21 @@ npx -y tsx /path/to/chatium/scripts/chatium-sync.ts <command> --cwd "$PWD"
 
 On Windows PowerShell use `${PWD}` instead of `"$PWD"`.
 
-Always run `begin` before reading, searching, opening, planning, or editing
-project source files in a Chatium-synced project. There is no separate
-`continue` command. If the user asks for follow-up work after reviewing a
-previous result, run `begin` again.
+You may read, search, and open project source files before `begin` for
+orientation, answering read-only questions, or deciding what work is needed.
+Treat this as an unrefreshed local snapshot. Do not edit source files, run
+`finish`, or rely on that snapshot as the latest server state until `begin`
+succeeds. There is no separate `continue` command. If the user asks for
+follow-up edits after reviewing a previous result, run `begin` again before
+changing files.
 
 The core safety rule is: never lose current uncommitted local changes. `begin`
 always stashes current local changes, pulls the latest Chatium server code,
 refreshes generated typings in `node_modules`, creates a local git baseline
-commit from the refreshed server state, then reapplies the stash. Current local
-changes remain uncommitted after `begin`.
+commit from the refreshed server state, then reapplies the stash. If a dirty git
+file already matches the Chatium synced checksum, `begin` preserves that local
+patch outside the baseline while still merging newer server-only edits into the
+baseline. Current local changes remain uncommitted after `begin`.
 
 After making the requested local code changes, run `finish`. `finish` always
 stashes current local changes, pulls the latest Chatium server code, creates a
@@ -44,23 +49,23 @@ Do not run `doctor` or `init` proactively on every request. Use them only to
 recover from an explicit `begin` or `finish` failure:
 
 - If `begin` or `finish` says the project must be opened through the Chatium VS Code
-  extension first, stop source inspection and help the user fix that sync setup.
+  extension first, stop the Chatium sync workflow and help the user fix that setup.
 - If `begin` or `finish` says Chatium auth is not initialized, run `init` once
   for that synced account folder, then rerun the original start command.
-- If `begin` or `finish` reports a Chatium sync conflict, stop before planning or editing
+- If `begin` or `finish` reports a Chatium sync conflict, stop before editing
   and ask the user how to resolve it.
 
 After `begin` succeeds:
 
-1. Make the requested local code changes.
-2. Run the smallest relevant validation.
-3. Run `finish` after local changes are complete.
+1. Re-check any source files whose exact contents matter if they were inspected before `begin`.
+2. Make the requested local code changes.
+3. Run the smallest relevant validation.
+4. Run `finish` after local changes are complete.
 
-After this skill triggers, treat source inspection as planning. Do not run
-`rg`, `sed`, `cat`, `ls`, open component files, inspect tests, or otherwise
-read project source before `begin` succeeds. The only allowed pre-start actions
-are reading this skill and running `begin`; run
-`doctor` or `init` only when needed to handle the specific start error.
+Before `begin`, keep source inspection read-only. It is fine to run `rg`,
+`sed`, `cat`, `ls`, open component files, and inspect tests, but do not make
+source edits or perform upload steps until `begin` succeeds. Run `doctor` or
+`init` only when needed to handle a specific `begin` or `finish` error.
 
 If `begin` fails with `Cannot reapply stashed local changes after begin refresh`,
 do not keep editing. Inspect the conflicted files reported by git and ask the
@@ -93,8 +98,8 @@ If the intended resolution is ambiguous, stop and ask the user how exactly to re
 
 Workflow commands:
 
-- `begin`: initializes git in the sync root if needed, excludes local system paths, stashes current local changes, runs `pull`, runs `typings`, creates a baseline commit for the latest server code, and reapplies the stash so local changes stay uncommitted.
-- `finish`: stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, and uploads only the diff from that new baseline. It leaves the local changes uncommitted after upload for user review. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
+- `begin`: initializes git in the sync root if needed, excludes local system paths, stashes current local changes, runs `pull`, runs `typings`, creates a baseline commit for the latest server code, and reapplies the stash so local changes stay uncommitted. Already-synced dirty git files stay visible in `git diff`; newer server edits in those same files are merged into the baseline when possible.
+- `finish`: stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, and uploads only the diff from that new baseline. It leaves the local changes uncommitted after upload for user review. Already-synced dirty git files use the same baseline-preserving server merge as `begin`. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
 
 Support commands, only for recovery or debugging:
 
