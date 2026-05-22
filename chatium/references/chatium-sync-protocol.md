@@ -56,7 +56,7 @@ Never upload or inspect these as Chatium source files:
 The helper mirrors the VS Code extension `MonacoDocsSyncer` for generated typings:
 
 - `begin` is the only edit/upload start or resume command. Read-only local source inspection may happen before it. `begin` stashes current local work before `pull`, refreshes typings and the baseline from the latest server state, then reapplies the stash so local edits remain uncommitted. Dirty git files that already match the Chatium synced checksum stay outside the baseline so `git diff` remains useful after upload/review cycles.
-- `finish` stashes current local work before `pull`, creates a fresh baseline from the latest server state, reapplies the stash, uploads the resulting diff, and leaves those local edits uncommitted for user review. It uses the same baseline-preserving merge for already-synced dirty git files.
+- `finish` stashes current local work before `pull`, creates a fresh baseline from the latest server state, reapplies the stash, uploads pending diff entries, and leaves those local edits uncommitted for user review. Dirty files that already match the Chatium `syncedChecksum` are skipped instead of uploaded again. It uses the same baseline-preserving merge for already-synced dirty git files.
 - `typings` can be run directly to refresh only generated typings.
 - The helper calls `GET /s/entity/monaco-get-all-builtin-content`.
 - The response `deps` map is written under `<syncRoot>/node_modules`.

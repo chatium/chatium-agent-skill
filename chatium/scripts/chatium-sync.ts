@@ -15,6 +15,7 @@ import {
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? '0'
 
@@ -31,7 +32,7 @@ const initialStashAnchorMessage = 'chatium initial empty baseline for stash'
 const gitAuthorName = 'Chatium Sync'
 const gitAuthorEmail = 'chatium-sync@local'
 
-type Entity = {
+export type Entity = {
   id: string
   slug: string
   path: string
@@ -41,12 +42,12 @@ type Entity = {
   isDirectory: boolean
 }
 
-type EntityWithState = Entity & {
+export type EntityWithState = Entity & {
   state?: string
   syncedChecksum?: string
 }
 
-type TreeFile = {
+export type TreeFile = {
   backendSessionId?: string
   debugSocketId?: string | null
   filePutUrl?: string
@@ -82,6 +83,10 @@ type Env = {
   treePath: string
 }
 
+type SyncRootEnv = {
+  syncRoot: string
+}
+
 type RemoteTreeResponse = {
   success: boolean
   items: Entity[]
@@ -101,9 +106,21 @@ type MonacoDocsRecord = {
   isFile?: boolean
 }
 
-type Change =
+export type Change =
   | { status: 'A' | 'M' | 'D'; path: string }
   | { status: 'R'; oldPath: string; path: string }
+
+type RenameChange = Extract<Change, { status: 'R' }>
+type FileChange = Exclude<Change, { status: 'D' }>
+type DeleteChange = Extract<Change, { status: 'D' }>
+
+export type UploadPlan = {
+  renameUploads: RenameChange[]
+  fileUploads: FileChange[]
+  deleteUploads: DeleteChange[]
+  skippedAlreadySynced: Change[]
+  conflicts: string[]
+}
 
 type CliArgs = {
   command: string
@@ -125,11 +142,18 @@ type PullOptions = {
   preserveSyncedLocalChanges?: Map<string, SyncedLocalChange>
 }
 
-main().catch(error => {
-  const message = error instanceof Error ? error.message : String(error)
-  console.error(message)
-  process.exit(1)
-})
+if (isDirectRun()) {
+  main().catch(error => {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(message)
+    process.exit(1)
+  })
+}
+
+function isDirectRun(): boolean {
+  const entrypoint = process.argv[1]
+  return !!entrypoint && import.meta.url === pathToFileURL(path.resolve(entrypoint)).href
+}
 
 async function main() {
   const args = parseArgs(process.argv.slice(2))
@@ -320,25 +344,31 @@ async function finish(args: CliArgs) {
   const remoteItems = mapRemoteItems(remote.body.items)
   saveTree(env, tree)
 
-  for (const change of changes.filter((item): item is Extract<Change, { status: 'R' }> => item.status === 'R')) {
+  const uploadPlan = classifyUploadChanges(env, changes, tree, remoteItems)
+  if (uploadPlan.conflicts.length > 0) {
+    throw new Error(`Chatium upload conflicts:\n${uploadPlan.conflicts.map(item => `- ${item}`).join('\n')}`)
+  }
+
+  for (const change of uploadPlan.renameUploads) {
     await uploadRename(env, auth, tree, remoteItems, change)
   }
 
-  for (const change of changes) {
-    if (change.status === 'R') {
-      const filePath = path.join(env.syncRoot, change.path)
-      if (existsSync(filePath) && sha1File(filePath) !== tree.items?.[change.path]?.syncedChecksum) {
-        await uploadFile(env, auth, tree, remoteItems, change.path, baselineCommit)
-      }
-    } else if (change.status === 'D') {
-      await uploadDelete(env, auth, tree, remoteItems, change.path)
-    } else {
-      await uploadFile(env, auth, tree, remoteItems, change.path, baselineCommit)
-    }
+  for (const change of uploadPlan.deleteUploads) {
+    await uploadDelete(env, auth, tree, remoteItems, change.path)
+  }
+
+  for (const change of uploadPlan.fileUploads) {
+    await uploadFile(env, auth, tree, remoteItems, change.path, baselineCommit)
   }
 
   saveTree(env, tree)
-  console.log(`Uploaded ${changes.length} change(s) to Chatium.`)
+  const pendingCount = countPendingUploads(uploadPlan)
+  const skippedCount = uploadPlan.skippedAlreadySynced.length
+  if (pendingCount === 0) {
+    console.log(`No pending Chatium uploads. Skipped ${skippedCount} already synced change(s).`)
+  } else {
+    console.log(`Uploaded ${pendingCount} pending change(s) to Chatium. Skipped ${skippedCount} already synced change(s).`)
+  }
 }
 
 function preflight(args: CliArgs): Env {
@@ -1293,6 +1323,157 @@ function getChangesSinceBaseline(env: Env, baselineCommit: string): Change[] {
   }
 
   return changes
+}
+
+export function classifyUploadChanges(
+  env: SyncRootEnv,
+  changes: Change[],
+  tree: TreeFile,
+  remoteItems: Record<string, Entity>,
+): UploadPlan {
+  const plan: UploadPlan = {
+    renameUploads: [],
+    fileUploads: [],
+    deleteUploads: [],
+    skippedAlreadySynced: [],
+    conflicts: [],
+  }
+
+  for (const change of changes) {
+    if (change.status === 'R') {
+      classifyRenameUploadChange(env, change, tree, remoteItems, plan)
+    } else if (change.status === 'D') {
+      classifyDeleteUploadChange(env, change, tree, remoteItems, plan)
+    } else {
+      classifyFileUploadChange(env, change, tree, remoteItems, plan)
+    }
+  }
+
+  return plan
+}
+
+function classifyFileUploadChange(
+  env: SyncRootEnv,
+  change: Extract<Change, { status: 'A' | 'M' }>,
+  tree: TreeFile,
+  remoteItems: Record<string, Entity>,
+  plan: UploadPlan,
+) {
+  if (isSystemPath(change.path)) {
+    return
+  }
+
+  const localState = getLocalFileState(env, change.path)
+  if (!localState.exists || localState.isDirectory || !localState.checksum) {
+    return
+  }
+
+  const localItem = tree.items?.[change.path]
+  const remoteItem = remoteItems[change.path]
+  if (localItem?.syncedChecksum && localState.checksum === localItem.syncedChecksum) {
+    if (remoteItem?.checksum === localItem.syncedChecksum) {
+      plan.skippedAlreadySynced.push(change)
+      return
+    }
+    plan.conflicts.push(remoteItem
+      ? `${change.path}: local file already matches synced checksum, but server checksum changed`
+      : `${change.path}: local file already matches synced checksum, but file is missing on server`)
+    return
+  }
+
+  plan.fileUploads.push(change)
+}
+
+function classifyDeleteUploadChange(
+  env: SyncRootEnv,
+  change: DeleteChange,
+  tree: TreeFile,
+  remoteItems: Record<string, Entity>,
+  plan: UploadPlan,
+) {
+  if (isSystemPath(change.path)) {
+    return
+  }
+
+  const localPath = path.join(env.syncRoot, change.path)
+  const localItem = tree.items?.[change.path]
+  const remoteItem = remoteItems[change.path]
+  if (!existsSync(localPath) && !localItem && !remoteItem) {
+    plan.skippedAlreadySynced.push(change)
+    return
+  }
+  if (!existsSync(localPath) && remoteItem && localItem?.syncedChecksum && remoteItem.checksum !== localItem.syncedChecksum) {
+    plan.conflicts.push(`${change.path}: deleted locally, but server checksum changed`)
+    return
+  }
+
+  plan.deleteUploads.push(change)
+}
+
+function classifyRenameUploadChange(
+  env: SyncRootEnv,
+  change: RenameChange,
+  tree: TreeFile,
+  remoteItems: Record<string, Entity>,
+  plan: UploadPlan,
+) {
+  if (isSystemPath(change.oldPath) || isSystemPath(change.path)) {
+    return
+  }
+
+  const oldLocalItem = tree.items?.[change.oldPath]
+  const newLocalItem = tree.items?.[change.path]
+  const oldRemoteItem = remoteItems[change.oldPath]
+  const newRemoteItem = remoteItems[change.path]
+  const newLocalState = getLocalFileState(env, change.path)
+
+  if (!oldRemoteItem && newRemoteItem) {
+    if (newLocalItem?.syncedChecksum && newLocalState.checksum === newLocalItem.syncedChecksum) {
+      if (newRemoteItem.checksum === newLocalItem.syncedChecksum) {
+        plan.skippedAlreadySynced.push(change)
+        return
+      }
+      plan.conflicts.push(`${change.path}: renamed file already matches synced checksum, but server checksum changed`)
+      return
+    }
+
+    if (newLocalState.exists && !newLocalState.isDirectory) {
+      plan.skippedAlreadySynced.push(change)
+      plan.fileUploads.push(change)
+    }
+    return
+  }
+
+  if (oldRemoteItem && oldLocalItem?.syncedChecksum && !oldRemoteItem.isDirectory && oldRemoteItem.checksum !== oldLocalItem.syncedChecksum) {
+    plan.conflicts.push(`${change.oldPath}: changed on server before rename upload`)
+    return
+  }
+
+  plan.renameUploads.push(change)
+  if (!newLocalState.exists || newLocalState.isDirectory || !newLocalState.checksum) {
+    return
+  }
+
+  const syncedChecksum = newLocalItem?.syncedChecksum ?? oldLocalItem?.syncedChecksum
+  if (!syncedChecksum || newLocalState.checksum !== syncedChecksum) {
+    plan.fileUploads.push(change)
+  }
+}
+
+function getLocalFileState(env: SyncRootEnv, itemPath: string): { checksum?: string; exists: boolean; isDirectory: boolean } {
+  const localPath = path.join(env.syncRoot, itemPath)
+  if (!existsSync(localPath)) {
+    return { exists: false, isDirectory: false }
+  }
+  const stat = statSync(localPath)
+  if (stat.isDirectory()) {
+    return { exists: true, isDirectory: true }
+  }
+  return { checksum: sha1File(localPath), exists: true, isDirectory: false }
+}
+
+function countPendingUploads(plan: UploadPlan): number {
+  return plan.renameUploads.length + plan.deleteUploads.length + plan.fileUploads.length
 }
 
 function git(cwd: string, args: string[], options: { allowFailure?: boolean } = {}) {
