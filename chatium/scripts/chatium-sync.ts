@@ -311,18 +311,19 @@ async function begin(args: CliArgs) {
 
 async function finish(args: CliArgs) {
   const env = preflight(args)
-  readState(env)
+  const state = readState(env)
   const auth = readAuth(env)
   ensureGitRepo(env.syncRoot)
   ensureGitExcludeIfRepo(env.syncRoot)
 
-  const preserveSyncedLocalChanges = captureSyncedLocalChanges(env)
+  const baselineCommitBeforeRefresh = state.baselineCommit
+  const changes = getChangesSinceBaseline(env, baselineCommitBeforeRefresh)
+  const preserveSyncedLocalChanges = captureSyncedLocalChanges(env, baselineCommitBeforeRefresh)
   const stash = stashCurrentChanges(env, finishStashMessage)
-  let baselineCommit: string
 
   try {
     await pull(env, auth, { preserveSyncedLocalChanges })
-    baselineCommit = createAndStoreBaseline(env)
+    createAndStoreBaseline(env)
 
     if (stash) {
       applyFinishStash(env, stash)
@@ -331,8 +332,6 @@ async function finish(args: CliArgs) {
   } catch (error) {
     throw withPreservedStashMessage(error, stash, 'finish')
   }
-
-  const changes = getChangesSinceBaseline(env, baselineCommit)
 
   if (changes.length === 0) {
     console.log('No local changes since Chatium baseline.')
@@ -358,7 +357,7 @@ async function finish(args: CliArgs) {
   }
 
   for (const change of uploadPlan.fileUploads) {
-    await uploadFile(env, auth, tree, remoteItems, change.path, baselineCommit)
+    await uploadFile(env, auth, tree, remoteItems, change.path, baselineCommitBeforeRefresh)
   }
 
   saveTree(env, tree)
@@ -593,15 +592,14 @@ async function pull(env: Env, auth: AuthFile, options: PullOptions = {}): Promis
   return tree
 }
 
-function captureSyncedLocalChanges(env: Env): Map<string, SyncedLocalChange> {
+function captureSyncedLocalChanges(env: Env, baselineCommit = resolveLocalChangesBaselineCommit(env)): Map<string, SyncedLocalChange> {
   const result = new Map<string, SyncedLocalChange>()
-  const head = git(env.syncRoot, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
-  if (head.status !== 0) {
+  if (!baselineCommit) {
     return result
   }
 
   const tree = readTree(env)
-  for (const change of getChangesSinceBaseline(env, head.stdout.trim())) {
+  for (const change of getChangesSinceBaseline(env, baselineCommit)) {
     const itemPath = change.path
     if (isSystemPath(itemPath) || change.status === 'D') {
       continue
@@ -622,6 +620,19 @@ function captureSyncedLocalChanges(env: Env): Map<string, SyncedLocalChange> {
     }
   }
   return result
+}
+
+function resolveLocalChangesBaselineCommit(env: Env): string | null {
+  const statePath = stateSourcePath(env)
+  if (statePath) {
+    return readJson<StateFile>(statePath).baselineCommit
+  }
+
+  const head = git(env.syncRoot, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
+  if (head.status !== 0) {
+    return null
+  }
+  return head.stdout.trim() || null
 }
 
 async function applyRemoteChangeOverPreservedBaseline(
@@ -1289,7 +1300,7 @@ function getShortGitStatus(env: Env): string {
   return git(env.syncRoot, ['status', '--short'], { allowFailure: true }).stdout.trim()
 }
 
-function getChangesSinceBaseline(env: Env, baselineCommit: string): Change[] {
+export function getChangesSinceBaseline(env: SyncRootEnv, baselineCommit: string): Change[] {
   const diff = git(env.syncRoot, ['diff', '--name-status', '-M', baselineCommit, '--']).stdout
   const changes: Change[] = []
 

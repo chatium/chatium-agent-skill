@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { classifyUploadChanges, type Change, type Entity, type TreeFile } from './chatium-sync.ts'
+import { classifyUploadChanges, getChangesSinceBaseline, type Change, type Entity, type TreeFile } from './chatium-sync.ts'
 
 test('skips modified files that already match the synced checksum', () => {
   withFixture(syncRoot => {
@@ -87,6 +88,23 @@ test('skips renames that are already reflected on Chatium', () => {
   })
 })
 
+test('detects committed local changes since the stored baseline', () => {
+  withFixture(syncRoot => {
+    git(syncRoot, ['init'])
+    writeSource(syncRoot, 'app.ts', 'server')
+    git(syncRoot, ['add', 'app.ts'])
+    git(syncRoot, ['-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', 'baseline'])
+    const baselineCommit = git(syncRoot, ['rev-parse', 'HEAD']).stdout.trim()
+
+    writeSource(syncRoot, 'app.ts', 'committed local change')
+    git(syncRoot, ['add', 'app.ts'])
+    git(syncRoot, ['-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-m', 'local change'])
+
+    const changes = getChangesSinceBaseline({ syncRoot }, baselineCommit)
+    assert.deepEqual(changes, [{ status: 'M', path: 'app.ts' }])
+  })
+})
+
 function withFixture(run: (syncRoot: string) => void) {
   const syncRoot = mkdtempSync(path.join(tmpdir(), 'chatium-sync-test-'))
   try {
@@ -123,4 +141,12 @@ function entity(itemPath: string, checksum: string): Entity {
     entityType: 'file',
     isDirectory: false,
   }
+}
+
+function git(cwd: string, args: string[]): { stdout: string } {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8' })
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || `git ${args.join(' ')} failed`)
+  }
+  return { stdout: result.stdout || '' }
 }

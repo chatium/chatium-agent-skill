@@ -37,15 +37,18 @@ file already matches the Chatium synced checksum, `begin` preserves that local
 patch outside the baseline while still merging newer server-only edits into the
 baseline. Current local changes remain uncommitted after `begin`.
 
-After making the requested local code changes, run `finish`. `finish` always
-stashes current local changes, pulls the latest Chatium server code, creates a
-local git baseline commit from the refreshed server state, reapplies the stash,
-and uploads pending local diff entries to Chatium. Dirty files that already
-match the Chatium synced checksum are skipped instead of uploaded again.
-`finish` must leave the local changes in the worktree uncommitted so the user
-can inspect or request further edits. If the user requests further edits after
-`finish`, run `begin` again; it will preserve the existing uncommitted changes
-before refreshing the baseline.
+After making the requested local code changes, run `finish`. `finish` first
+records the task changes relative to the stored Chatium baseline, then stashes
+current local changes, pulls the latest Chatium server code, creates a local
+git baseline commit from the refreshed server state, reapplies the stash, and
+uploads the recorded task changes to Chatium. This still uploads changes that
+were already placed into local git commits after `begin`. Dirty files that
+already match the Chatium synced checksum are skipped instead of uploaded
+again. Any still-uncommitted local changes must remain uncommitted in the
+worktree so the user can inspect or request further edits. Changes already
+committed locally stay committed locally, but are still uploaded. If the user
+requests further edits after `finish`, run `begin` again; it will preserve the
+existing uncommitted changes before refreshing the baseline.
 
 Do not run `doctor` or `init` proactively on every request. Use them only to
 recover from an explicit `begin` or `finish` failure:
@@ -101,7 +104,7 @@ If the intended resolution is ambiguous, stop and ask the user how exactly to re
 Workflow commands:
 
 - `begin`: initializes git in the sync root if needed, excludes local system paths, stashes current local changes, runs `pull`, runs `typings`, creates a baseline commit for the latest server code, and reapplies the stash so local changes stay uncommitted. Already-synced dirty git files stay visible in `git diff`; newer server edits in those same files are merged into the baseline when possible.
-- `finish`: stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, and uploads only pending diff entries from that new baseline. It skips dirty files that already match the Chatium `syncedChecksum`, leaving them visible in the worktree for review. Already-synced dirty git files use the same baseline-preserving server merge as `begin`. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
+- `finish`: records task changes relative to the stored Chatium baseline, stashes local task changes, runs `pull`, creates a new baseline commit for the latest server code, reapplies the stash, and uploads the recorded task changes. This includes task changes that were already committed locally after `begin`. It skips dirty files that already match the Chatium `syncedChecksum`, leaving them visible in the worktree for review. Already-synced dirty git files use the same baseline-preserving server merge as `begin`. If the stash cannot be applied cleanly, it keeps the stash and stops without uploading.
 
 Support commands, only for recovery or debugging:
 
