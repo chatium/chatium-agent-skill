@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { classifyUploadChanges, getChangesSinceBaseline, type Change, type Entity, type TreeFile } from './chatium-sync.ts'
+import { classifyUploadChanges, classifyRemoteSyncState, getChangesSinceBaseline, type Change, type Entity, type TreeFile } from './chatium-sync.ts'
 
 test('skips modified files that already match the synced checksum', () => {
   withFixture(syncRoot => {
@@ -102,6 +102,68 @@ test('detects committed local changes since the stored baseline', () => {
 
     const changes = getChangesSinceBaseline({ syncRoot }, baselineCommit)
     assert.deepEqual(changes, [{ status: 'M', path: 'app.ts' }])
+  })
+})
+
+test('requests download when remote file changed and local file is unchanged', () => {
+  withFixture(syncRoot => {
+    const syncedChecksum = writeSource(syncRoot, 'app.ts', 'server')
+    writeSource(syncRoot, 'app.ts', 'server')
+    const tree = treeWith(entity('app.ts', syncedChecksum))
+    const remoteItems = {
+      'app.ts': entity('app.ts', checksumFor('server updated')),
+    }
+
+    const state = classifyRemoteSyncState({ syncRoot }, tree, remoteItems)
+
+    assert.deepEqual(state.downloads, ['app.ts'])
+    assert.deepEqual(state.conflicts, [])
+  })
+})
+
+test('detects local+remote conflicts before finish', () => {
+  withFixture(syncRoot => {
+    const syncedChecksum = writeSource(syncRoot, 'app.ts', 'server')
+    writeSource(syncRoot, 'app.ts', 'local')
+    const tree = treeWith(entity('app.ts', syncedChecksum))
+    const remoteItems = {
+      'app.ts': entity('app.ts', checksumFor('server updated')),
+    }
+
+    const state = classifyRemoteSyncState({ syncRoot }, tree, remoteItems)
+
+    assert.deepEqual(state.downloads, [])
+    assert.equal(state.conflicts.length, 1)
+    assert.match(state.conflicts[0], /changed locally and on server/)
+  })
+})
+
+test('requests download when remote file is missing and local file is unchanged', () => {
+  withFixture(syncRoot => {
+    const syncedChecksum = checksumFor('server')
+    writeSource(syncRoot, 'app.ts', 'server')
+    const tree = treeWith(entity('app.ts', syncedChecksum))
+    const remoteItems = {} as Record<string, Entity>
+
+    const state = classifyRemoteSyncState({ syncRoot }, tree, remoteItems)
+
+    assert.deepEqual(state.downloads, ['app.ts'])
+    assert.deepEqual(state.conflicts, [])
+  })
+})
+
+test('reports conflict when local file changed but missing on server', () => {
+  withFixture(syncRoot => {
+    const syncedChecksum = checksumFor('server')
+    writeSource(syncRoot, 'app.ts', 'local')
+    const tree = treeWith(entity('app.ts', syncedChecksum))
+    const remoteItems = {} as Record<string, Entity>
+
+    const state = classifyRemoteSyncState({ syncRoot }, tree, remoteItems)
+
+    assert.deepEqual(state.downloads, [])
+    assert.equal(state.conflicts.length, 1)
+    assert.match(state.conflicts[0], /deleted on server and changed locally/)
   })
 })
 

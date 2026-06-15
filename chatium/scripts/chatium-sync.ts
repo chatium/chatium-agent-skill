@@ -138,8 +138,19 @@ type SyncedLocalChange = {
   syncedChecksum: string
 }
 
+type SyncState = {
+  downloads: string[]
+  conflicts: string[]
+}
+
+type PullRemoteTree = {
+  body: RemoteTreeResponse
+  setCookie: string | null
+}
+
 type PullOptions = {
   preserveSyncedLocalChanges?: Map<string, SyncedLocalChange>
+  remoteTree?: PullRemoteTree
 }
 
 if (isDirectRun()) {
@@ -318,19 +329,39 @@ async function finish(args: CliArgs) {
 
   const baselineCommitBeforeRefresh = state.baselineCommit
   const changes = getChangesSinceBaseline(env, baselineCommitBeforeRefresh)
-  const preserveSyncedLocalChanges = captureSyncedLocalChanges(env, baselineCommitBeforeRefresh)
-  const stash = stashCurrentChanges(env, finishStashMessage)
+  const tree = readTree(env)
+  const remote = await fetchRemoteTree(env, auth, tree)
+  const remoteItems = mapRemoteItems(remote.body.items)
 
-  try {
-    await pull(env, auth, { preserveSyncedLocalChanges })
-    createAndStoreBaseline(env)
+  const uploadPlan = classifyUploadChanges(env, changes, tree, remoteItems)
+  const remoteSyncState = classifyRemoteSyncState(env, tree, remoteItems)
+  const allConflicts = [...uploadPlan.conflicts, ...remoteSyncState.conflicts]
+  if (allConflicts.length > 0) {
+    throw new Error(`Chatium upload conflicts:\n${allConflicts.map(item => `- ${item}`).join('\n')}`)
+  }
 
-    if (stash) {
-      applyFinishStash(env, stash)
-      dropLocalChangesStash(env, stash)
+  const shouldPull = remoteSyncState.downloads.length > 0
+  const shouldCreateBaseline = shouldPull || changes.length > 0
+  let treeAfterPull = tree
+  let stash: LocalChangesStash | null = null
+
+  if (shouldCreateBaseline) {
+    const preserveSyncedLocalChanges = shouldPull ? captureSyncedLocalChanges(env, baselineCommitBeforeRefresh) : undefined
+    stash = stashCurrentChanges(env, finishStashMessage)
+
+    try {
+      if (shouldPull) {
+        treeAfterPull = await pull(env, auth, { preserveSyncedLocalChanges, remoteTree: remote })
+      }
+      createAndStoreBaseline(env)
+
+      if (stash) {
+        applyFinishStash(env, stash)
+        dropLocalChangesStash(env, stash)
+      }
+    } catch (error) {
+      throw withPreservedStashMessage(error, stash, 'finish')
     }
-  } catch (error) {
-    throw withPreservedStashMessage(error, stash, 'finish')
   }
 
   if (changes.length === 0) {
@@ -338,29 +369,21 @@ async function finish(args: CliArgs) {
     return
   }
 
-  const tree = readTree(env)
-  const remote = await fetchRemoteTree(env, auth, tree)
-  const remoteItems = mapRemoteItems(remote.body.items)
-  saveTree(env, tree)
-
-  const uploadPlan = classifyUploadChanges(env, changes, tree, remoteItems)
-  if (uploadPlan.conflicts.length > 0) {
-    throw new Error(`Chatium upload conflicts:\n${uploadPlan.conflicts.map(item => `- ${item}`).join('\n')}`)
-  }
+  saveTree(env, treeAfterPull)
 
   for (const change of uploadPlan.renameUploads) {
-    await uploadRename(env, auth, tree, remoteItems, change)
+    await uploadRename(env, auth, treeAfterPull, remoteItems, change)
   }
 
   for (const change of uploadPlan.deleteUploads) {
-    await uploadDelete(env, auth, tree, remoteItems, change.path)
+    await uploadDelete(env, auth, treeAfterPull, remoteItems, change.path)
   }
 
   for (const change of uploadPlan.fileUploads) {
-    await uploadFile(env, auth, tree, remoteItems, change.path, baselineCommitBeforeRefresh)
+    await uploadFile(env, auth, treeAfterPull, remoteItems, change.path, baselineCommitBeforeRefresh)
   }
 
-  saveTree(env, tree)
+  saveTree(env, treeAfterPull)
   const pendingCount = countPendingUploads(uploadPlan)
   const skippedCount = uploadPlan.skippedAlreadySynced.length
   if (pendingCount === 0) {
@@ -507,7 +530,16 @@ function writeState(env: Env, state: StateFile) {
 
 async function pull(env: Env, auth: AuthFile, options: PullOptions = {}): Promise<TreeFile> {
   const tree = readTree(env)
-  const remote = await fetchRemoteTree(env, auth, tree)
+  const remote = options.remoteTree ?? (await fetchRemoteTree(env, auth, tree))
+  tree.filePutUrl = remote.body.filePutUrl ?? tree.filePutUrl
+  tree.socketBaseUrl = remote.body.socketBaseUrl ?? tree.socketBaseUrl
+  tree.debugSocketId = remote.body.debugSocketId ?? tree.debugSocketId
+  if (remote.setCookie) {
+    const sessionId = parseSessionId(remote.setCookie)
+    if (sessionId) {
+      tree.backendSessionId = sessionId
+    }
+  }
   const remoteItems = mapRemoteItems(remote.body.items)
   const conflicts: string[] = []
 
@@ -1481,6 +1513,99 @@ function getLocalFileState(env: SyncRootEnv, itemPath: string): { checksum?: str
     return { exists: true, isDirectory: true }
   }
   return { checksum: sha1File(localPath), exists: true, isDirectory: false }
+}
+
+export function classifyRemoteSyncState(
+  env: SyncRootEnv,
+  tree: TreeFile,
+  remoteItems: Record<string, Entity>,
+): SyncState {
+  const state: SyncState = {
+    downloads: [],
+    conflicts: [],
+  }
+
+  for (const [oldPath, oldItem] of Object.entries(tree.items ?? {})) {
+    if (isSystemPath(oldPath)) {
+      continue
+    }
+    if (oldItem.isDirectory) {
+      continue
+    }
+
+    const remoteItem = remoteItems[oldPath]
+
+    if (!remoteItem) {
+      const localState = getLocalFileState(env, oldPath)
+      if (!localState.exists) {
+        continue
+      }
+      if (localState.isDirectory || !localState.checksum) {
+        state.conflicts.push(`${oldPath}: deleted on server but local path type changed`)
+        continue
+      }
+      if (!oldItem.syncedChecksum) {
+        state.conflicts.push(`${oldPath}: deleted on server, but local change state is unknown`)
+        continue
+      }
+      if (localState.checksum === oldItem.syncedChecksum) {
+        state.downloads.push(oldPath)
+      } else {
+        state.conflicts.push(`${oldPath}: deleted on server and changed locally`)
+      }
+      continue
+    }
+  }
+
+  for (const remoteItem of Object.values(remoteItems)) {
+    const itemPath = remoteItem.path
+    if (isSystemPath(itemPath)) {
+      continue
+    }
+    if (remoteItem.isDirectory) {
+      const localPath = path.join(env.syncRoot, itemPath)
+      if (!existsSync(localPath)) {
+        state.downloads.push(itemPath)
+      } else if (statSync(localPath).isDirectory()) {
+        // nothing to do
+      } else {
+        state.conflicts.push(`${itemPath}: local file exists but server has directory`)
+      }
+      continue
+    }
+
+    const localPath = path.join(env.syncRoot, itemPath)
+    const localItem = tree.items?.[itemPath]
+    if (!existsSync(localPath)) {
+      state.downloads.push(itemPath)
+      continue
+    }
+
+    const localState = getLocalFileState(env, itemPath)
+    if (!localState.exists || localState.isDirectory || !localState.checksum) {
+      if (localState.exists && localState.isDirectory) {
+        state.conflicts.push(`${itemPath}: local directory exists but server has file`)
+      }
+      continue
+    }
+
+    if (localState.checksum === remoteItem.checksum) {
+      continue
+    }
+
+    if (localItem?.syncedChecksum === localState.checksum) {
+      state.downloads.push(itemPath)
+      continue
+    }
+
+    if (remoteItem.checksum === localItem?.syncedChecksum) {
+      continue
+    }
+
+    state.conflicts.push(`${itemPath}: changed locally and on server`)
+  }
+
+  return state
 }
 
 function countPendingUploads(plan: UploadPlan): number {
